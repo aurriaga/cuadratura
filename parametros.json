@@ -1,0 +1,60 @@
+{
+  "_comentario": "Tabla de parámetros de Cuadratura. Edita este archivo y todas las copias instaladas se actualizan solas. Cada lista se ordena por fecha: la app usa el último tramo cuyo 'desde' ya pasó respecto del período que se está trabajando. Solo incluye las listas que quieras reemplazar; lo que no pongas queda con el valor que trae la app.",
+  "verificado": "2026-09-12",
+
+  "imm": [
+    {"desde":"2025-05-01","gen":529000,"menor":394622,"noRem":340574,"ley":"Ley 21.751"},
+    {"desde":"2026-01-01","gen":539000,"menor":402082,"noRem":347434,"ley":"Ley 21.751"},
+    {"desde":"2026-05-01","gen":553553,"menor":412938,"noRem":356815,"ley":"Ley 21.830"}
+  ],
+
+  "topes": [
+    {"desde":"2025-01-01","afp":87.8,"afc":131.9,"ips":60,"apvMes":50,"apvAno":600},
+    {"desde":"2026-01-01","afp":89.9,"afc":135.1,"ips":60,"apvMes":50,"apvAno":600},
+    {"desde":"2026-02-01","afp":90.0,"afc":135.2,"ips":60,"apvMes":50,"apvAno":600}
+  ],
+
+  "afp": [
+    {"n":"Modelo","t":0.1058},{"n":"Uno","t":0.1046},{"n":"PlanVital","t":0.1116},
+    {"n":"Habitat","t":0.1127},{"n":"Capital","t":0.1144},{"n":"Cuprum","t":0.1144},
+    {"n":"ProVida","t":0.1145},{"n":"IPS (ex INP)","t":0.1855}
+  ],
+
+  "aporteEmpleador": [
+    {"desde":"2025-08-01","t":0.01,"sisAparte":true},
+    {"desde":"2026-08-01","t":0.035,"sisAparte":false},
+    {"desde":"2027-08-01","t":0.0425,"sisAparte":false},
+    {"desde":"2028-08-01","t":0.05,"sisAparte":false},
+    {"desde":"2029-08-01","t":0.057,"sisAparte":false},
+    {"desde":"2030-08-01","t":0.064,"sisAparte":false},
+    {"desde":"2031-08-01","t":0.071,"sisAparte":false},
+    {"desde":"2032-08-01","t":0.078,"sisAparte":false},
+    {"desde":"2033-08-01","t":0.085,"sisAparte":false}
+  ],
+
+  "sis": [
+    {"desde":"2026-01-01","t":0.0154},{"desde":"2026-04-01","t":0.0162},{"desde":"2026-07-01","t":0.0200}
+  ],
+
+  "asigFam": [
+    {"desde":"2025-05-01","tramos":[{"h":620251,"m":21607},{"h":905941,"m":13260},{"h":1412957,"m":4188},{"h":1000000000000,"m":0}]},
+    {"desde":"2026-05-01","tramos":[{"h":649039,"m":22601},{"h":947990,"m":13870},{"h":1478539,"m":4382},{"h":1000000000000,"m":0}]}
+  ],
+
+  "retHon": [
+    {"desde":"2025-01-01","t":0.145},{"desde":"2026-01-01","t":0.1525},
+    {"desde":"2027-01-01","t":0.16},{"desde":"2028-01-01","t":0.17}
+  ],
+
+  "salud": 0.07,
+  "mutual": 0.0093,
+  "gratifTopeIMM": 4.75,
+  "afc": {"indefTrab":0.006,"indefEmp":0.024,"plazoEmp":0.030},
+
+  "vence": [
+    {"hasta":"2027-12-31","q":"La tasa de 12,5% del Pro Pyme General y la rebaja del PPM a la mitad rigen hasta el año comercial 2027 (Ley 21.755). En 2028 suben a 15% y al PPM completo."},
+    {"hasta":"2027-07-31","q":"El aporte del empleador de la Ley 21.735 sube de 3,5% a 4,25% con las remuneraciones de agosto de 2027."},
+    {"hasta":"2026-12-31","q":"Los topes imponibles en UF los reajusta la Superintendencia de Pensiones cada enero. Revisa los de 2027 en enero."},
+    {"hasta":"2026-12-31","q":"La retención de honorarios sube a 16% el 1 de enero de 2027."}
+  ]
+}

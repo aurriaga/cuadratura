@@ -1,0 +1,23 @@
+{
+  "name": "Cuadratura · contabilidad y tributación PYME Chile",
+  "short_name": "Cuadratura",
+  "description": "Un documento se captura una vez y alimenta el circuito tributario y el contable por separado. Al cierre, los dos tienen que cuadrar.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#F7F6F1",
+  "theme_color": "#16211C",
+  "lang": "es-CL",
+  "categories": ["business", "finance", "productivity"],
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Registrar documento", "url": "./#docs" },
+    { "name": "F29 del mes", "url": "./#f29" },
+    { "name": "Cuadratura", "url": "./#cuadre" }
+  ]
+}
