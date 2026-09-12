@@ -1,0 +1,41 @@
+name: Actualizar parámetros
+
+# Se ejecuta solo el día 2 y el 16 de cada mes, y también a mano desde la
+# pestaña Actions. El día 2 porque Previred publica los indicadores del mes
+# durante los primeros días; el 16 por si hubo una corrección.
+on:
+  schedule:
+    - cron: '0 13 2,16 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Leer las fuentes y actualizar parametros.json
+        env:
+          APIGATEWAY_TOKEN: ${{ secrets.APIGATEWAY_TOKEN }}
+        run: node robot/actualizar.mjs
+
+      - name: Publicar si algo cambió
+        run: |
+          if [ -n "$(git status --porcelain parametros.json)" ]; then
+            git config user.name  "robot de Cuadratura"
+            git config user.email "actions@github.com"
+            git add parametros.json
+            git commit -m "Parámetros previsionales al $(date +%Y-%m-%d)"
+            git push
+            echo "### Parámetros actualizados" >> $GITHUB_STEP_SUMMARY
+            git show --stat --oneline HEAD >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Sin cambios: los parámetros ya estaban al día." >> $GITHUB_STEP_SUMMARY
+          fi
