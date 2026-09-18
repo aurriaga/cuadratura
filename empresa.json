@@ -1,0 +1,30 @@
+{
+  "_comentario": "Copia este archivo a entrada/<tu-empresa>/empresa.json y edítalo. Solo 'nombre' es obligatorio.",
+
+  "nombre": "Comercial El Roble Ltda",
+  "rut": "76.543.210-K",
+  "regimen": "14D3",
+  "ejercicio": 2026,
+  "mes": 8,
+
+  "_mes": "Mes de corte, contando desde 0. 8 = septiembre. Es hasta dónde llega el informe.",
+  "_regimen": "14D3 Pro Pyme General · 14D8 Pro Pyme Transparente · 14A Semi Integrado",
+
+  "sobre50kUF": false,
+  "inventarioPermanente": true,
+  "creditoIva": true,
+  "fechaApertura": "2026-01-01",
+
+  "cuentas": {
+    "ventas": "4101",
+    "compras": "1105"
+  },
+  "_cuentas": "Cuenta a la que van los documentos importados de cada registro.",
+
+  "compartir": {
+    "base": "https://aurriaga.github.io/cuadratura/informes",
+    "tributario": true,
+    "documentos": false,
+    "nota": ""
+  }
+}

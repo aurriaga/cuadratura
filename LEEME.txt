@@ -1,0 +1,14 @@
+Una carpeta por empresa. Adentro de cada una:
+
+  empresa.json          los datos de la empresa (obligatorio)
+  plan*.xlsx            el plan de cuentas del cliente
+  apertura*.xlsx        los saldos iniciales
+  diario*.xlsx          los libros diarios
+  ventas*.csv           el registro de ventas del SII
+  compras*.csv          el registro de compras del SII
+  cartola*.pdf          las cartolas del banco
+
+El nombre del archivo le dice al robot qué es. Si no lo dice, lo deduce
+mirando las columnas. Los Excel con varias hojas se clasifican hoja por hoja.
+
+Después ejecuta:   node robot/cargar.mjs --informes

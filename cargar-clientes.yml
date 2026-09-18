@@ -1,0 +1,39 @@
+name: Cargar clientes
+
+# Se ejecuta cuando subes archivos nuevos a la carpeta entrada/, y también a
+# mano desde la pestaña Actions.
+on:
+  push:
+    paths:
+      - 'entrada/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cargar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Procesar las carpetas de clientes
+        run: node robot/cargar.mjs --informes
+
+      - name: Publicar lo generado
+        run: |
+          if [ -n "$(git status --porcelain salida informes)" ]; then
+            git config user.name  "robot de Cuadratura"
+            git config user.email "actions@github.com"
+            git add salida informes
+            git commit -m "Carga de clientes al $(date +%Y-%m-%d)"
+            git push
+            echo "### Clientes procesados" >> $GITHUB_STEP_SUMMARY
+            git show --stat --oneline HEAD >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Sin cambios." >> $GITHUB_STEP_SUMMARY
+          fi
