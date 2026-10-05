@@ -2109,29 +2109,70 @@ function inferirPorNombre(nom){
   return null;
 }
 
+// El plazo de una cuenta decide si va al corriente o al no corriente, y eso
+// cambia por completo la lectura del estado de situación: la razón corriente,
+// el capital de trabajo y la liquidez salen de ahí.
+// Primero lo que la empresa escribió explícitamente (C/P, L/P), después las
+// reglas que no admiten discusión, y por último el nombre del rubro.
+function plazoPorNombre(nom){
+  const bruto = String(nom || '');
+  const n = normCab(bruto);
+  if(!n) return null;
+  // Lo que la cuenta declara. Se mira como palabra suelta y no como final del
+  // texto: "Banco Itaú CLP" termina en LP y no es de largo plazo.
+  const marca = re => re.test(bruto);
+  if(marca(/(^|[\s\-.,(])(c\s*\/\s*p|c\.p\.?|cp)([\s\-.,)]|$)/i) || /corto\s*plazo/i.test(bruto)) return 'c';
+  if(marca(/(^|[\s\-.,(])(l\s*\/\s*p|l\.p\.?|lp)([\s\-.,)]|$)/i) || /largo\s*plazo/i.test(bruto)) return 'nc';
+  if(/no\s*corriente/i.test(bruto)) return 'nc';
+  // Reglas contables firmes
+  if(/impuesto\w*diferid|activo\w*diferid|pasivo\w*diferid/.test(n)) return 'nc';   // NIIF PYMES 29
+  if(/derechodeuso|activoporderecho/.test(n)) return 'nc';                            // arrendamientos
+  if(/dep\w*acum|amortiz\w*acum/.test(n)) return 'nc';
+  if(/terreno|construccion|edificio|maquinaria|vehiculo|mueble|equipo|instalacion|intangible|activofijo|plusvalia|marcas?ypatentes/.test(n)) return 'nc';
+  if(/hipotecari|leasing|bonosporpagar|obligacionesconelpublico/.test(n)) return 'nc';
+  // Rubros que por naturaleza se realizan dentro del año
+  if(/caja|efectivo|banco|cliente|deudores|existencia|mercaderia|inventario|ivacredito|ivadebito|creditofiscal|debitofiscal|proveedor|acreedor|remuneracion|cotizacion|isapre|afp|retencion|impuestosporpagar|provisionvacacion/.test(n)) return 'c';
+  return null;
+}
+
 // Cada empresa numera su plan como quiere: hay quien usa el 3 para patrimonio
 // y quien lo usa para ingresos. En vez de imponer una convención, se aprende
 // la del cliente: se miran las cuentas cuyo nombre no deja dudas y se ve qué
 // significa cada tramo de códigos en SU plan.
 function aprenderConvencion(cuentas){
-  const votos = {};
+  const votos = {}, plazos = {};
   cuentas.forEach(({cod, nom})=>{
-    const pn = inferirPorNombre(nom);
-    if(!pn || pn.debil) return;
     const d = String(cod||'').replace(/\D/g,'');
     if(!d) return;
-    const fam = familiaTipo(pn.tipo);
-    [d.slice(0,1), d.slice(0,2), d.slice(0,3)].forEach(k=>{
-      if(!k) return;
-      votos[k] = votos[k] || {};
-      votos[k][fam] = (votos[k][fam] || 0) + 1;
-    });
+    const tramos = [d.slice(0,1), d.slice(0,2), d.slice(0,3)];
+    const pn = inferirPorNombre(nom);
+    if(pn && !pn.debil){
+      const fam = familiaTipo(pn.tipo);
+      tramos.forEach(k=>{ if(!k) return; votos[k] = votos[k]||{}; votos[k][fam] = (votos[k][fam]||0)+1; });
+    }
+    // El plazo también se aprende: en casi todos los planes chilenos el 11 y el
+    // 21 son corrientes y el 12 y el 22 no lo son, pero no en todos.
+    const pz = plazoPorNombre(nom);
+    if(pz) tramos.forEach(k=>{ if(!k) return; plazos[k] = plazos[k]||{}; plazos[k][pz] = (plazos[k][pz]||0)+1; });
   });
+  votos.__plazos = plazos;
   return votos;
+}
+function plazoAprendido(votos, cod){
+  const plazos = (votos && votos.__plazos) || {};
+  const d = String(cod||'').replace(/\D/g,'');
+  for(const k of [d.slice(0,3), d.slice(0,2)]){
+    const v = plazos[k];
+    if(!v) continue;
+    const orden = Object.keys(v).sort((a,b)=>v[b]-v[a]);
+    if(orden.length === 1 || v[orden[0]] > v[orden[1]]) return orden[0];
+  }
+  return null;
 }
 function familiaAprendida(votos, cod){
   const d = String(cod||'').replace(/\D/g,'');
   for(const k of [d.slice(0,3), d.slice(0,2), d.slice(0,1)]){
+    if(k === '__plazos') continue;
     const v = votos[k];
     if(!v) continue;
     const orden = Object.keys(v).sort((a,b)=>v[b]-v[a]);
@@ -2164,23 +2205,28 @@ function inferirPorCodigo(cod){
 function inferirCuenta(cod, nom, votos){
   const pn = inferirPorNombre(nom);
   const fam = votos ? familiaAprendida(votos, cod) : null;
+  // El plazo se resuelve aparte del tipo: manda lo que diga el nombre, después
+  // el tramo del plan, y si no hay nada, corriente.
+  const pzNombre = plazoPorNombre(nom);
+  const pzTramo = votos ? plazoAprendido(votos, cod) : null;
+  const plazo = (t) => (t === 'activo' || t === 'activoC' || t === 'pasivo')
+    ? (pzNombre || pzTramo || 'c') : '';
+  const conPlazo = (o) => Object.assign({}, o, {clase: plazo(o.tipo)});
 
   if(pn && !pn.debil){
     // Las complementarias y las de patrimonio las define el nombre aunque el
     // tramo del código diga otra cosa.
-    if(pn.tipo === 'activoC' || pn.tipo === 'patrimonioD') return pn;
-    if(!fam || familiaTipo(pn.tipo) === fam) return pn;
+    if(pn.tipo === 'activoC' || pn.tipo === 'patrimonioD') return conPlazo(pn);
+    if(!fam || familiaTipo(pn.tipo) === fam) return conPlazo(pn);
     // Si el plan del cliente contradice al nombre, manda el plan, pero se
     // conserva el detalle del nombre cuando es compatible.
-    const base = TIPO_DE_FAMILIA[fam];
-    return (pn.clase && (fam === 'activo' || fam === 'pasivo'))
-      ? {tipo: base.tipo, clase: pn.clase, sub: ''}
-      : Object.assign({}, base);
+    return conPlazo(TIPO_DE_FAMILIA[fam]);
   }
-  if(pn && pn.debil && (!fam || familiaTipo(pn.tipo) === fam)) return {tipo:pn.tipo, clase:pn.clase, sub:pn.sub};
-  if(fam) return Object.assign({}, TIPO_DE_FAMILIA[fam]);
-  if(pn) return {tipo:pn.tipo, clase:pn.clase, sub:pn.sub};
-  return inferirPorCodigo(cod) || {tipo:'activo', clase:'c', sub:''};
+  if(pn && pn.debil && (!fam || familiaTipo(pn.tipo) === fam)) return conPlazo(pn);
+  if(fam) return conPlazo(TIPO_DE_FAMILIA[fam]);
+  if(pn) return conPlazo(pn);
+  const pc = inferirPorCodigo(cod);
+  return conPlazo(pc || {tipo:'activo', clase:'c', sub:''});
 }
 const TIPO_CORTO = {activo:'Activo', activoC:'Activo (complementaria)', pasivo:'Pasivo',
   patrimonio:'Patrimonio', patrimonioD:'Patrimonio (deudora)', ingreso:'Ingreso', gasto:'Gasto'};
@@ -2279,6 +2325,32 @@ function mapearLibro(cab){
   return mapa;
 }
 
+// Un balance de sumas cargado como libro diario produce asientos sin sentido,
+// y nadie se da cuenta porque cuadran. Se detecta qué es el archivo mirando si
+// sus filas traen fechas y si las cuentas se repiten.
+function detectarModoLibro(filas, mapa, ini){
+  const cuerpo = filas.slice(ini + 1).filter(f => (f||[]).some(x=>String(x).trim()!==''));
+  if(!cuerpo.length) return null;
+  const hayImportes = mapa.debe !== undefined || mapa.haber !== undefined || mapa.monto !== undefined;
+  if(!hayImportes) return 'plan';
+  let conFecha = 0;
+  const cuentas = {};
+  let repetidas = 0;
+  cuerpo.forEach(f=>{
+    if(mapa.fecha !== undefined){
+      const v = String(f[mapa.fecha] || '').trim();
+      if(v && /^\d{4}-\d{2}-\d{2}$/.test(fechaISO(v, null) || '')) conFecha++;
+    }
+    const cc = String((mapa.codigo !== undefined ? f[mapa.codigo] : f[mapa.nombre]) || '').trim();
+    if(cc){ if(cuentas[cc]) repetidas++; cuentas[cc] = 1; }
+  });
+  // Con fechas en buena parte de las filas, es un diario.
+  if(conFecha >= cuerpo.length * 0.3) return 'diario';
+  // Sin fechas y con una línea por cuenta, es un balance de sumas o saldos.
+  if(repetidas <= cuerpo.length * 0.1) return 'saldos';
+  return 'diario';
+}
+
 function analizarLibro(txt, modo, anoDefecto, filasPre){
   const filas = filasPre || parseCSV(txt, detectarDelim(txt));
   if(filas.length < 2) return {error:'El archivo no tiene filas suficientes.'};
@@ -2347,6 +2419,8 @@ function analizarLibro(txt, modo, anoDefecto, filasPre){
                  debe:R(debe), haber:R(haber)});
   });
 
+  const modoDetectado = detectarModoLibro(filas, mapa, ini);
+
   if(modo === 'plan'){
     // Trae el plan completo, incluidas las cuentas sin movimiento: son las que
     // el cliente reserva para el año y las que más cuesta reconstruir después.
@@ -2368,7 +2442,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre){
     const lista = Object.values(todas).filter(x=>x.cod);
     const votos = aprenderConvencion(lista);
     lista.forEach(x=> Object.assign(x, inferirCuenta(x.cod, x.nom, votos)));
-    return {cab, mapa, modo, lineas:[], nuevas:lista, asociadas:[], problemas,
+    return {cab, mapa, modo, modoDetectado, lineas:[], nuevas:lista, asociadas:[], problemas,
             avisos: revisarCuentasNuevas(lista, votos), debe:0, haber:0, dif:0,
             asientos:[], leidas:cuerpo.length};
   }
@@ -2418,7 +2492,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre){
   if(modo === 'saldos'){
     const debe = lineas.reduce((a,l)=>a+l.debe,0), haber = lineas.reduce((a,l)=>a+l.haber,0);
     const listaN = Object.values(nuevas);
-    return {cab, mapa, modo, lineas, nuevas:listaN, asociadas:Object.values(asociadas),
+    return {cab, mapa, modo, modoDetectado, lineas, nuevas:listaN, asociadas:Object.values(asociadas),
             avisos: revisarCuentasNuevas(listaN, votosPlan),
             problemas, debe, haber, dif:debe-haber, asientos:[], leidas:cuerpo.length};
   }
@@ -2451,7 +2525,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre){
   });
 
   const listaNuevas = Object.values(nuevas);
-  return {cab, mapa, modo, lineas, nuevas:listaNuevas, asociadas:Object.values(asociadas),
+  return {cab, mapa, modo, modoDetectado, lineas, nuevas:listaNuevas, asociadas:Object.values(asociadas),
           avisos: revisarCuentasNuevas(listaNuevas, votosPlan),
           problemas, asientos:ok, malos, leidas:cuerpo.length,
           debe: ok.reduce((a,x)=>a+x.debe,0), haber: ok.reduce((a,x)=>a+x.haber,0)};
@@ -4656,6 +4730,12 @@ function formLibro(){
       Si no hay número de asiento, agrupa por fecha y glosa; y si tampoco hay glosa, va acumulando hasta que Debe y Haber calcen.</div>
   </details>` : an.error ? `<div class="note warn" style="margin-top:10px">${esc(an.error)}</div>` : `
 
+    ${an.modoDetectado && an.modoDetectado !== an.modo ? `<div class="card" style="margin-top:12px;border-left:4px solid var(--warn)">
+      <h3 style="font-size:14px">Este archivo no parece ser ${esc({diario:'un libro diario', saldos:'un balance', plan:'un plan de cuentas'}[an.modo])}</h3>
+      <p class="sub">Por cómo vienen sus filas, parece <b>${esc({diario:'un libro diario', saldos:'un balance de sumas o saldos', plan:'solo un plan de cuentas'}[an.modoDetectado])}</b>.
+      Si lo cargas con el modo equivocado, los números entran igual pero quedan mal: un balance traído como diario genera asientos que no existieron.</p>
+      <div class="row"><button class="btn" data-lbmodo="${an.modoDetectado}">Cambiar a ${esc({diario:'libro diario', saldos:'saldos de apertura', plan:'plan de cuentas'}[an.modoDetectado])}</button></div>
+    </div>` : ''}
     <div class="note ${(an.modo==='saldos' ? an.dif===0 : an.asientos.length) ? 'ok':'warn'}" style="margin-top:12px">
       Leí ${an.leidas} fila(s) y reconocí ${an.lineas.length} línea(s) con importes.
       ${an.modo==='plan'
@@ -6026,6 +6106,11 @@ document.addEventListener('click', e=>{
   if(t.dataset.fil){ S.ui.filtroDoc=t.dataset.fil; render(); return; }
   if(t.dataset.rm){ S.ui.remunModo=t.dataset.rm; guardar(); render(); return; }
   if(t.dataset.ci){ S.ui.cierreModo=t.dataset.ci; guardar(); render(); return; }
+  if(t.dataset.lbmodo){
+    lib.modo = t.dataset.lbmodo;
+    lib.an = analizarLibro('', lib.modo, S.emp.ejercicio, filasDeHoja(lib) || lib.filas);
+    render(); return;
+  }
   if(t.dataset.dm){ S.ui.diarioModo=t.dataset.dm; guardar(); render(); return; }
   if(t.dataset.rev){ S.ui.revisorModo=t.dataset.rev; guardar(); render(); return; }
   if(t.dataset.bal){ S.ui.balanceTodo = t.dataset.bal==='todo'; guardar(); render(); return; }
