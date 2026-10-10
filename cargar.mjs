@@ -32,10 +32,11 @@
  *
  * No duplica código: carga las mismas funciones de lectura que usa la app,
  * sacándolas de index.html. Si mañana arreglamos un parser, el robot lo hereda.
+ * Sus pruebas están en robot/probar.mjs.
  */
 
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, statSync } from 'node:fs';
-import { dirname, join, basename, extname } from 'node:path';
+import { dirname, join, basename, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const AQUI = dirname(fileURLToPath(import.meta.url));
@@ -51,11 +52,13 @@ const CON_INFORMES = tiene('--informes');
 
 let fallas = 0;
 const avisos = [];
-const log = (...a) => console.log(...a);
-const falla = m => { fallas++; console.error('ERROR  ' + m); };
+let silencio = false;                     // las pruebas no necesitan ver el detalle
+const log = (...a) => { if(!silencio) console.log(...a); };
+const falla = m => { fallas++; if(!silencio) console.error('ERROR  ' + m); };
+export function silenciar(v){ silencio = v !== false; }
 
 /* ---------- se carga el motor de la app ---------- */
-function montarEntorno(){
+export function montarEntorno(raiz = RAIZ){
   // La app está escrita para el navegador; se le dan las piezas mínimas para
   // que corra en Node. No se toca nada de su lógica.
   const noop = () => {};
@@ -82,7 +85,7 @@ function montarEntorno(){
   if(typeof globalThis.DecompressionStream === 'undefined') throw new Error('Se necesita Node 18 o superior.');
   if(typeof globalThis.FileReader === 'undefined') globalThis.FileReader = class {};
 
-  const html = readFileSync(join(RAIZ, 'index.html'), 'utf8');
+  const html = readFileSync(join(raiz, 'index.html'), 'utf8');
   const m = html.match(/<script>\n([\s\S]*)\n<\/script>/);
   if(!m) throw new Error('No encuentro el código dentro de index.html');
   // El temporizador de guardado no debe dejar el proceso vivo.
@@ -95,7 +98,8 @@ function montarEntorno(){
       'confirmarLibro','adivinarClase','mapearColumnas','mapearBanco','mapearLibro','normCab',
       'detectarDelim','parseCSV','filasATexto','generarInforme','nombreInforme','urlInforme',
       'qrSVG','cuadraDiario','esf','eri','asientosDelEjercicio','fmt','emparejar',
-      'informeConciliacion','registrarDoc','addAsiento','uid','saldos','CTA','PLAN_ACT']
+      'informeConciliacion','registrarDoc','addAsiento','uid','saldos','CTA','PLAN_ACT',
+      'numCSV','fechaISO']
       .forEach(k=>{ try{ salida[k] = eval(k); }catch(e){} });
     salida.fijarS = v => { S = v; };
   `);
@@ -112,28 +116,66 @@ const TIPOS = [
   {k:'compras',  re:/compra|rcv.?cpa|recibid/i,             n:'registro de compras'},
   {k:'cartola',  re:/cartola|banco|movimientos|extracto/i,  n:'cartola bancaria'}
 ];
-function tipoPorNombre(archivo){
+const NOMBRE_MODO = {diario:'un libro diario', saldos:'un balance de sumas o saldos', plan:'un plan de cuentas'};
+export function tipoPorNombre(archivo){
   const base = basename(archivo);
   for(const t of TIPOS) if(t.re.test(base)) return t.k;
   return null;
 }
-// Si el nombre no lo dice, se deduce mirando los encabezados.
-function tipoPorContenido(api, filas){
+// Si el nombre no lo dice, se deduce mirando los encabezados. Devuelve también
+// las columnas encontradas: sirven para decidir entre hojas de un mismo archivo.
+export function perfilHoja(api, filas){
   for(const f of filas.slice(0, 20)){
     if(f.filter(x=>String(x).trim()!=='').length < 2) continue;
     const mb = api.mapearBanco(f);
-    if(mb.fecha !== undefined && (mb.cargo !== undefined || mb.abono !== undefined)) return 'cartola';
+    if(mb.fecha !== undefined && (mb.cargo !== undefined || mb.abono !== undefined)) return {tipo:'cartola', mapa:mb};
     const mc = api.mapearColumnas(f);
     if(mc.total !== undefined && (mc.folio !== undefined || mc.tipo !== undefined)){
       const clase = api.adivinarClase(f);
-      return clase === 'venta' ? 'ventas' : 'compras';
+      return {tipo: clase === 'venta' ? 'ventas' : 'compras', mapa:mc};
     }
     const ml = api.mapearLibro(f);
+    // Con Debe y Haber: si trae fechas es un diario; si no, un balance de sumas o saldos
     if((ml.debe !== undefined || ml.haber !== undefined) && (ml.codigo !== undefined || ml.nombre !== undefined))
-      return 'diario';
-    if(ml.codigo !== undefined && ml.nombre !== undefined && ml.debe === undefined) return 'plan';
+      return {tipo: ml.fecha !== undefined ? 'diario' : 'apertura', mapa:ml};
+    // Código y nombre sin Debe ni Haber: un plan; si trae una columna de monto,
+    // suele ser un estado financiero ya elaborado a partir de otra hoja
+    if(ml.codigo !== undefined && ml.nombre !== undefined && ml.debe === undefined)
+      return {tipo:'plan', mapa:ml, informe: ml.monto !== undefined};
   }
-  return null;
+  return {tipo:null, mapa:null};
+}
+export function tipoPorContenido(api, filas){ return perfilHoja(api, filas).tipo; }
+
+// Nombre de empresa comparable: sin tildes, espacios ni forma jurídica.
+const claveEmpresa = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+  .replace(/[^a-z0-9]/g, '').replace(/(spa|sa|ltda|limitada|sociedadanonima|eirl)$/, '');
+const mencionaEmpresa = (texto, k) => { const c = claveEmpresa(texto); return k.length >= 4 && c.length >= 4 && (c.includes(k) || (c.length >= 8 && k.includes(c))); };
+
+// Un libro con una hoja por empresa ("ESF Farmacéutica", "ESF Bajamar"…): se
+// cargan solo las de esta empresa. Se reconoce porque el nombre de la empresa
+// está en el título de una hoja y, en el mismo lugar de sus hermanas, hay otro.
+function hojasDeOtraEmpresa(hojas, nombreEmpresa){
+  const k = claveEmpresa(nombreEmpresa);
+  const otras = new Set();
+  if(k.length < 4) return otras;
+  const titulo = f => new Set(f.map(x => String(x).trim()).filter(Boolean)).size <= 2;
+  hojas.forEach(m=>{
+    let pos = null;
+    for(let r = 0; r < 4 && !pos; r++){
+      const f = m.filas[r] || [];
+      if(!titulo(f)) continue;
+      const c = f.findIndex(x => mencionaEmpresa(x, k));
+      if(c >= 0) pos = [r, c];
+    }
+    if(!pos) return;
+    hojas.forEach(x=>{
+      if(x === m || mencionaEmpresa(x.nombre, k)) return;
+      const f = x.filas[pos[0]] || [], v = String(f[pos[1]] || '').trim();
+      if(v && titulo(f) && !mencionaEmpresa(v, k) && !/^\d/.test(v)) otras.add(x.nombre);
+    });
+  });
+  return otras;
 }
 
 async function filasDeArchivo(api, ruta){
@@ -145,15 +187,20 @@ async function filasDeArchivo(api, ruta){
   const delim = api.detectarDelim(r.texto);
   return {filas: api.parseCSV(r.texto, delim), hojas: null};
 }
+const listaPaginas = p => p.length === 1 ? 'la página ' + p[0] + ' es' : 'las páginas ' + p.join(', ') + ' son';
 
 /* ---------- procesar una empresa ---------- */
-async function procesarEmpresa(api, carpeta){
+export async function procesarEmpresa(api, carpeta){
   const nombreCarpeta = basename(carpeta);
   log(`\n── ${nombreCarpeta} ──────────────────────────────`);
+  // avisos y errores de esta empresa: el resumen final dice cuál quedó mal
+  const misAvisos = [], misErrores = [];
+  const av = m => { misAvisos.push(m); avisos.push(m); };
+  const fa = m => { misErrores.push(m); falla(m); };
 
   const cfgRuta = join(carpeta, 'empresa.json');
   if(!existsSync(cfgRuta)){
-    falla(`${nombreCarpeta}: falta empresa.json`);
+    fa(`${nombreCarpeta}: falta empresa.json`);
     return null;
   }
   const cfg = JSON.parse(readFileSync(cfgRuta, 'utf8'));
@@ -185,22 +232,35 @@ async function procesarEmpresa(api, carpeta){
     const ruta = join(carpeta, f);
     let filas, hojas;
     try { ({filas, hojas} = await filasDeArchivo(api, ruta)); }
-    catch(e){ avisos.push(`${nombreCarpeta}/${f}: ${e.message}`); continue; }
-    if(!filas || !filas.length){ avisos.push(`${nombreCarpeta}/${f}: sin filas legibles`); continue; }
+    catch(e){ av(`${nombreCarpeta}/${f}: ${e.message}`); continue; }
+    if(!filas || !filas.length){ av(`${nombreCarpeta}/${f}: sin filas legibles`); continue; }
+    // Un PDF con páginas escaneadas: lo que está en ellas no se puede leer
+    if(filas.paginasImagen && filas.paginasImagen.length)
+      av(`${f}: ${listaPaginas(filas.paginasImagen)} una imagen escaneada; lo que contiene no se pudo leer`);
     // Con varias hojas se clasifica cada una por su contenido: un mismo archivo
     // suele traer el plan de cuentas y el libro diario en pestañas distintas.
     if(hojas && hojas.length > 1){
-      hojas.filter(h=>!h.oculta).forEach(h=>{
-        if(h.celdas < 6) return;                       // portadas e índices
-        const t = tipoPorContenido(api, h.filas) || tipoPorNombre(h.nombre) || tipoPorNombre(f);
-        if(!t){ avisos.push(`${nombreCarpeta}/${f} [${h.nombre}]: no pude reconocer qué es`); return; }
-        clasificados.push({f, ruta, tipo:t, filas:h.filas, hojas:null, hoja:h.nombre});
+      const vivas = hojas.filter(h => !h.oculta && h.celdas >= 6);      // fuera portadas e índices
+      const ajenas = hojasDeOtraEmpresa(vivas, S.emp.nombre);
+      const perfiles = vivas.map(h => ({h, p: perfilHoja(api, h.filas)}));
+      const conImportes = perfiles.filter(x => x.p.mapa && (x.p.mapa.debe !== undefined || x.p.mapa.haber !== undefined));
+      perfiles.forEach(({h, p})=>{
+        if(ajenas.has(h.nombre)){ av(`${f} [${h.nombre}]: es de otra empresa; no se carga`); return; }
+        // un estado financiero armado desde otra hoja del mismo archivo repetiría los datos
+        if(p.informe && conImportes.length){
+          av(`${f} [${h.nombre}]: es un informe ya elaborado; los datos se toman de la hoja «${conImportes[0].h.nombre}»`);
+          return;
+        }
+        const t = p.tipo || tipoPorNombre(h.nombre) || tipoPorNombre(f);
+        if(!t){ av(`${nombreCarpeta}/${f} [${h.nombre}]: no pude reconocer qué es`); return; }
+        clasificados.push({f, ruta, tipo:t, porNombre: !p.tipo, filas:h.filas, hojas:null, hoja:h.nombre});
       });
       continue;
     }
-    const tipo = tipoPorNombre(f) || tipoPorContenido(api, filas);
-    if(!tipo){ avisos.push(`${nombreCarpeta}/${f}: no pude reconocer qué es`); continue; }
-    clasificados.push({f, ruta, tipo, filas, hojas});
+    const tipoN = tipoPorNombre(f);
+    const tipo = tipoN || tipoPorContenido(api, filas);
+    if(!tipo){ av(`${nombreCarpeta}/${f}: no pude reconocer qué es`); continue; }
+    clasificados.push({f, ruta, tipo, porNombre: !!tipoN, filas, hojas});
   }
   clasificados.sort((a,b)=> (prioridad[a.tipo] ?? 9) - (prioridad[b.tipo] ?? 9) || a.f.localeCompare(b.f));
 
@@ -214,25 +274,50 @@ async function procesarEmpresa(api, carpeta){
       const etq = c.f + (g.etq ? ` [${g.etq}]` : '');
       try {
         if(c.tipo === 'plan' || c.tipo === 'apertura' || c.tipo === 'diario'){
-          const modo = c.tipo === 'plan' ? 'plan' : c.tipo === 'apertura' ? 'saldos' : 'diario';
-          const an = api.analizarLibro('', modo, S.emp.ejercicio, g.filas);
-          if(an.error){ avisos.push(`${etq}: ${an.error}`); resumen.omitidos++; continue; }
+          let modo = c.tipo === 'plan' ? 'plan' : c.tipo === 'apertura' ? 'saldos' : 'diario';
+          const opciones = {empresa: cfg.empresaEnArchivo};
+          let an = api.analizarLibro('', modo, S.emp.ejercicio, g.filas, opciones);
+          if(an.error){ av(`${etq}: ${an.error}`); resumen.omitidos++; continue; }
+          // Las filas pueden contradecir la clasificación: un balance sin fechas
+          // leído como diario inventaría asientos.
+          const det = an.modoDetectado;
+          if(modo !== 'plan' && det && det !== 'plan' && det !== modo){
+            if(c.porNombre) av(`${etq}: el nombre dice ${NOMBRE_MODO[modo]}, pero sus filas parecen ${NOMBRE_MODO[det]}. Se leyó según el nombre; cámbialo si no corresponde`);
+            else {
+              av(`${etq}: se leyó como ${NOMBRE_MODO[det]} por cómo vienen sus filas`);
+              modo = det;
+              an = api.analizarLibro('', modo, S.emp.ejercicio, g.filas, opciones);
+              if(an.error){ av(`${etq}: ${an.error}`); resumen.omitidos++; continue; }
+            }
+          }
+          // Varias empresas en la misma tabla: se carga solo la que corresponde,
+          // y si ninguna se llama como esta, no se adivina.
+          if(an.empresas){
+            if(!an.empresaCoincide){
+              fa(`${etq}: trae ${an.empresas.length} empresas (${an.empresas.map(e=>e.nombre).join(', ')}) y ninguna coincide con «${S.emp.nombre}». ` +
+                 `Escribe en empresa.json "empresaEnArchivo": "<nombre exacto>" para elegir una`);
+              resumen.omitidos++; continue;
+            }
+            log(`   ${etq}: de ${an.empresas.length} empresas en el archivo se tomó «${an.empresa}»`);
+          }
           if(modo === 'saldos' && an.dif){
-            falla(`${etq}: el balance de apertura está descuadrado en ${api.fmt(Math.abs(an.dif))}`);
+            const pag = g.filas.paginasImagen;
+            fa(`${etq}: el balance de apertura está descuadrado en ${api.fmt(Math.abs(an.dif))}` +
+               (pag && pag.length ? ` (${listaPaginas(pag)} una imagen escaneada: probablemente faltan las cuentas que están ahí)` : ''));
             resumen.omitidos++; continue;
           }
           if(an.malos && an.malos.length)
-            avisos.push(`${etq}: ${an.malos.length} asiento(s) no cuadran y se omiten`);
+            av(`${etq}: ${an.malos.length} asiento(s) no cuadran y se omiten`);
           if(an.avisos && an.avisos.length)
-            an.avisos.filter(a=>a.nivel==='alto').forEach(a=> avisos.push(`${etq}: ${a.t} — ${a.q}`));
+            an.avisos.filter(a=>a.nivel==='alto').forEach(a=> av(`${etq}: ${a.t} — ${a.q}`));
           const n = api.confirmarLibro(an, cfg.fechaApertura || (S.emp.ejercicio + '-01-01'));
           if(modo === 'plan'){ resumen.cuentas += n; log(`   ${etq}: ${n} cuenta(s) al plan`); }
-          else { resumen.asientos += n; log(`   ${etq}: ${n} asiento(s)`); }
+          else { resumen.asientos += n; log(`   ${etq}: ${n} asiento(s)${modo === 'saldos' ? ` de apertura con ${an.lineas.length} cuenta(s)` : ''}`); }
         }
         else if(c.tipo === 'ventas' || c.tipo === 'compras'){
           const clase = c.tipo === 'ventas' ? 'venta' : 'compra';
           const an = api.analizarImport('', clase, S.emp.ejercicio, g.filas);
-          if(an.error){ avisos.push(`${etq}: ${an.error}`); resumen.omitidos++; continue; }
+          if(an.error){ av(`${etq}: ${an.error}`); resumen.omitidos++; continue; }
           const cta = (cfg.cuentas && cfg.cuentas[c.tipo]) || (clase === 'venta' ? '4101' : '1105');
           const n = api.confirmarImport(an, cta, cfg.creditoIva !== false);
           resumen.docs += n;
@@ -240,28 +325,34 @@ async function procesarEmpresa(api, carpeta){
         }
         else if(c.tipo === 'cartola'){
           const an = api.analizarCartola('', S.emp.ejercicio, g.filas);
-          if(an.error){ avisos.push(`${etq}: ${an.error}`); resumen.omitidos++; continue; }
-          S.banco.movs = S.banco.movs.concat(an.movs).sort((a,b)=> a.fecha < b.fecha ? -1 : 1);
+          if(an.error){ av(`${etq}: ${an.error}`); resumen.omitidos++; continue; }
+          S.banco.movs = S.banco.movs.concat(an.movs).sort((a,b)=> a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : 0);
           resumen.movs += an.movs.length;
           log(`   ${etq}: ${an.movs.length} movimiento(s) de banco`);
+          // lo mismo que la app muestra al cargarla: saltos de saldo y control con lo que declara el banco
+          (an.problemas || []).filter(p => !/sin monto$/.test(p)).forEach(p => av(`${etq}: ${p}`));
+          if(an.control && Math.abs(an.control.dif) > 1)
+            av(`${etq}: los movimientos suman ${api.fmt(an.control.suma)}, pero el saldo pasa de ${api.fmt(an.control.inicial)} a ${api.fmt(an.control.final)}: diferencia de ${api.fmt(an.control.dif)}`);
         }
-      } catch(e){ falla(`${etq}: ${e.message}`); resumen.omitidos++; }
+      } catch(e){ fa(`${etq}: ${e.message}`); resumen.omitidos++; }
     }
   }
 
   // Controles antes de dar por buena la carga
   const d = api.cuadraDiario();
-  if(d.dif !== 0) falla(`${nombreCarpeta}: el libro diario quedó descuadrado en ${api.fmt(Math.abs(d.dif))}`);
+  if(d.dif !== 0) fa(`${nombreCarpeta}: el libro diario quedó descuadrado en ${api.fmt(Math.abs(d.dif))}`);
   const E = api.esf(api.asientosDelEjercicio());
   if(Math.abs(E.activo - E.total) > 2)
-    falla(`${nombreCarpeta}: activo y pasivo más patrimonio difieren en ${api.fmt(Math.abs(E.activo - E.total))}`);
+    fa(`${nombreCarpeta}: activo y pasivo más patrimonio difieren en ${api.fmt(Math.abs(E.activo - E.total))}`);
 
   const conc = S.banco.movs.length ? api.informeConciliacion() : null;
   log(`   ─ ${resumen.docs} documentos · ${resumen.asientos} asientos · ${resumen.cuentas} cuentas · ${resumen.movs} movimientos de banco`);
   log(`   ─ diario ${d.dif === 0 ? 'cuadrado' : 'DESCUADRADO'} · resultado ${api.fmt(api.eri(api.asientosDelEjercicio()).neto)}`);
   if(conc) log(`   ─ conciliación: ${conc.E.pares.length} calzados, ${conc.E.soloBanco.length} por resolver`);
+  if(misErrores.length) log(`   ─ ${misErrores.length} error(es): esta empresa queda sin informe`);
 
-  return {S, cfg, resumen, nombreCarpeta, sano: d.dif === 0 && Math.abs(E.activo - E.total) <= 2};
+  return {S, cfg, resumen, nombreCarpeta, avisos: misAvisos, errores: misErrores,
+          sano: !misErrores.length && d.dif === 0 && Math.abs(E.activo - E.total) <= 2};
 }
 
 /* ---------- principal ---------- */
@@ -301,7 +392,7 @@ async function main(){
       writeFileSync(ruta, JSON.stringify(h.S), 'utf8');
       log(`\nEscrito ${ruta}`);
       if(CON_INFORMES){
-        if(!h.sano){ avisos.push(`${h.nombreCarpeta}: no se generó el informe porque la carga quedó descuadrada`); continue; }
+        if(!h.sano){ avisos.push(`${h.nombreCarpeta}: no se generó el informe porque la carga tuvo errores o quedó descuadrada`); continue; }
         const html = api.generarInforme(h.S.compartir);
         const arch = api.nombreInforme();
         writeFileSync(join(INFORMES, arch), html, 'utf8');
@@ -316,8 +407,12 @@ async function main(){
     avisos.slice(0, 40).forEach(a => log('  · ' + a));
     if(avisos.length > 40) log(`  · y ${avisos.length - 40} más`);
   }
-  log(`\n${hechas.length} empresa(s) procesada(s), ${hechas.filter(h=>h.sano).length} sin descuadres.`);
+  const malas = hechas.filter(h => !h.sano);
+  log(`\n${hechas.length} empresa(s) procesada(s): ${hechas.length - malas.length} sin problemas` +
+      (malas.length ? `, ${malas.length} con errores (${malas.map(h => h.nombreCarpeta).join(', ')})` : '') + '.');
   process.exit(fallas ? 1 : 0);
 }
 
-main().catch(e => { console.error('ERROR  ' + e.message); console.error(e.stack); process.exit(1); });
+// Se ejecuta solo si se llama directo (node robot/cargar.mjs); las pruebas lo importan
+const esPrincipal = process.argv[1] && resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
+if(esPrincipal) main().catch(e => { console.error('ERROR  ' + e.message); console.error(e.stack); process.exit(1); });

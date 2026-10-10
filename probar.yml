@@ -1,0 +1,29 @@
+name: Probar
+
+# Corre las pruebas del robot (y de los lectores de la app) cada vez que cambia
+# index.html o el robot. Si algo deja de leer bien, la marca queda en rojo en la
+# pestaña Actions y GitHub te avisa por correo.
+on:
+  push:
+    paths:
+      - 'index.html'
+      - 'robot/**'
+      - '.github/workflows/probar.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Pruebas del robot
+        run: node robot/probar.mjs

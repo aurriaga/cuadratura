@@ -1,6 +1,6 @@
 /* Cuadratura — cache del app shell para que abra sin conexión.
    Sube la versión cuando publiques cambios: obliga a refrescar el cache. */
-const CACHE = 'cuadratura-v1';
+const CACHE = 'cuadratura-v3';
 const ARCHIVOS = ['./', './index.html', './manifest.webmanifest',
                   './icon-192.png', './icon-512.png', './icon-maskable-512.png', './apple-touch-icon.png'];
 

@@ -2952,10 +2952,11 @@ function separarEmpresas(cab, cuerpo, pedida){
   if(nombres.length < 2) return null;
   const clave = n => normCab(n).replace(/(spa|sa|ltda|limitada|sociedadanonima|eirl)$/, '');
   const propia = normCab((typeof S !== 'undefined' && S.emp && S.emp.nombre) || '');
-  const elegida = (pedida && nombres.find(n => normCab(n) === normCab(pedida)))
-    || (propia.length >= 4 && nombres.find(n => clave(n).indexOf(clave(propia)) >= 0 || clave(propia).indexOf(clave(n)) >= 0))
-    || nombres[0];
-  return {columna: ce, elegida, empresas: nombres.map(n => ({nombre: n, filas: etiqueta.filter(e => e === n).length})), etiqueta};
+  const coincide = (pedida && nombres.find(n => normCab(n) === normCab(pedida)))
+    || (propia.length >= 4 && nombres.find(n => clave(n).indexOf(clave(propia)) >= 0 || clave(propia).indexOf(clave(n)) >= 0));
+  // sin coincidencia se muestra la primera, pero se informa: el robot no debe cargarla a ciegas
+  const elegida = coincide || nombres[0];
+  return {columna: ce, elegida, coincide: !!coincide, empresas: nombres.map(n => ({nombre: n, filas: etiqueta.filter(e => e === n).length})), etiqueta};
 }
 
 function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
@@ -2991,7 +2992,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
     filaArchivo = filaArchivo.filter((_, i) => sep.etiqueta[i] === sep.elegida);
     cuerpo = cuerpo.filter((_, i) => sep.etiqueta[i] === sep.elegida);
   }
-  const empresas = sep ? sep.empresas : null, empresa = sep ? sep.elegida : null;
+  const empresas = sep ? sep.empresas : null, empresa = sep ? sep.elegida : null, empresaCoincide = sep ? sep.coincide : null;
   // En un balance (sin fechas) la "Descripción" junto al código es el nombre de la cuenta, no una glosa
   if(mapa.nombre === undefined && mapa.glosa !== undefined && mapa.fecha === undefined && mapa.codigo !== undefined){
     mapa.nombre = mapa.glosa; delete mapa.glosa;
@@ -3080,7 +3081,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
     const lista = Object.values(todas).filter(x=>x.cod);
     const votos = aprenderConvencion(lista);
     lista.forEach(x=> Object.assign(x, inferirCuenta(x.cod, x.nom, votos)));
-    return {cab, mapa, modo, modoDetectado, empresas, empresa, paginasImagen: filas.paginasImagen || null, lineas:[], nuevas:lista, asociadas:[], problemas,
+    return {cab, mapa, modo, modoDetectado, empresas, empresa, empresaCoincide, paginasImagen: filas.paginasImagen || null, lineas:[], nuevas:lista, asociadas:[], problemas,
             avisos: revisarCuentasNuevas(lista, votos), debe:0, haber:0, dif:0,
             asientos:[], leidas:cuerpo.length};
   }
@@ -3130,7 +3131,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
   if(modo === 'saldos'){
     const debe = lineas.reduce((a,l)=>a+l.debe,0), haber = lineas.reduce((a,l)=>a+l.haber,0);
     const listaN = Object.values(nuevas);
-    return {cab, mapa, modo, modoDetectado, empresas, empresa, paginasImagen: filas.paginasImagen || null, lineas, nuevas:listaN, asociadas:Object.values(asociadas),
+    return {cab, mapa, modo, modoDetectado, empresas, empresa, empresaCoincide, paginasImagen: filas.paginasImagen || null, lineas, nuevas:listaN, asociadas:Object.values(asociadas),
             avisos: revisarCuentasNuevas(listaN, votosPlan),
             problemas, debe, haber, dif:debe-haber, asientos:[], leidas:cuerpo.length};
   }
@@ -3163,7 +3164,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
   });
 
   const listaNuevas = Object.values(nuevas);
-  return {cab, mapa, modo, modoDetectado, empresas, empresa, paginasImagen: filas.paginasImagen || null, lineas, nuevas:listaNuevas, asociadas:Object.values(asociadas),
+  return {cab, mapa, modo, modoDetectado, empresas, empresa, empresaCoincide, paginasImagen: filas.paginasImagen || null, lineas, nuevas:listaNuevas, asociadas:Object.values(asociadas),
           avisos: revisarCuentasNuevas(listaNuevas, votosPlan),
           problemas, asientos:ok, malos, leidas:cuerpo.length,
           debe: ok.reduce((a,x)=>a+x.debe,0), haber: ok.reduce((a,x)=>a+x.haber,0)};
@@ -5545,6 +5546,7 @@ function formLibro(){
     ${an.empresas && an.empresas.length > 1 ? `<div class="card" style="margin-top:12px;border-left:4px solid var(--warn)">
       <h3 style="font-size:14px">Este archivo trae ${an.empresas.length} empresas</h3>
       <p class="sub">Se lee una sola, porque sumar sus cuentas daría un balance que no existe. Elige cuál cargar en esta contabilidad.</p>
+      ${an.empresaCoincide ? '' : `<p class="sub" style="color:var(--warn)"><b>Ninguna se llama como la empresa de Ajustes${S.emp.nombre ? ' («' + esc(S.emp.nombre) + '»)' : ''}:</b> por ahora se muestra la primera. Revisa que sea la correcta antes de cargar.</p>`}
       <div><label>Empresa a leer</label><select id="lb_empresa">${an.empresas.map(e=>`<option value="${esc(e.nombre)}"${e.nombre===an.empresa?' selected':''}>${esc(e.nombre)} · ${e.filas} fila${e.filas===1?'':'s'}</option>`).join('')}</select></div>
     </div>` : ''}
 

@@ -15,11 +15,15 @@ jobs:
   cargar:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '24'
+
+      # si los lectores fallan con los archivos de prueba, no se tocan los de clientes
+      - name: Probar el robot antes de usarlo
+        run: node robot/probar.mjs
 
       - name: Procesar las carpetas de clientes
         run: node robot/cargar.mjs --informes

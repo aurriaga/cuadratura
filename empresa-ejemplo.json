@@ -21,6 +21,8 @@
   },
   "_cuentas": "Cuenta a la que van los documentos importados de cada registro.",
 
+  "_empresaEnArchivo": "Solo si un balance trae varias empresas y ninguna se llama como 'nombre': agrega \"empresaEnArchivo\" con el nombre exacto de la que corresponde. Si no coincide ninguna, el robot no carga nada en vez de adivinar.",
+
   "compartir": {
     "base": "https://aurriaga.github.io/cuadratura/informes",
     "tributario": true,

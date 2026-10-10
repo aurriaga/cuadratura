@@ -179,11 +179,38 @@ Antes de dar por buena una carga verifica que el diario cuadre y que el activo
 calce con el pasivo más patrimonio. Si algo no cuadra **no genera el informe** y
 falla con el detalle. Un balance de apertura descuadrado lo detiene de inmediato.
 
+Si un balance trae **varias empresas** (una columna *Empresa*, o una hoja por
+empresa), carga solo la que se llama como el `nombre` de `empresa.json`. Si
+ninguna coincide, no adivina: falla y te pide que agregues
+`"empresaEnArchivo": "<nombre exacto>"`. Las hojas que son un estado financiero
+ya armado a partir de otra hoja del mismo archivo se saltan, para no duplicar
+saldos. En cartolas, avisa los saltos de saldo; en PDF, las páginas escaneadas.
+
 Usa el mismo código de lectura que la app: si mañana corregimos un parser, el
 robot lo hereda sin tocar nada.
 
 También corre solo en GitHub: cada vez que subas archivos a `entrada/`, el
 workflow *Cargar clientes* los procesa y publica los informes actualizados.
+
+### Para ejecutarlo en tu computador
+
+Necesitas **Node 18 o superior** (recomendado: la versión LTS de
+[nodejs.org](https://nodejs.org)). En Windows también sirve, en una terminal:
+
+```
+winget install OpenJS.NodeJS.LTS
+```
+
+Antes de cargar clientes, comprueba que todo lee bien:
+
+```
+node robot/probar.mjs
+```
+
+Arma empresas de ejemplo con archivos inventados (CSV, Excel y PDF), las pasa
+por el robot y revisa el resultado. Tiene que terminar en *"11 de 11 pruebas
+pasan"*. GitHub corre las mismas pruebas solo (workflow *Probar*) cada vez que
+cambias `index.html` o el robot, y antes de cada carga de clientes.
 
 ## Antes de empezar a cargar datos
 

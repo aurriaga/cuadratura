@@ -82,7 +82,11 @@ const desdeDe = (p) => `${p.slice(0, 4)}-${p.slice(4)}-01`;
 async function traerPrevired(periodo) {
   const mock = arg('--mock');
   if (mock) { log(`  usando respuesta de prueba ${mock}`); return JSON.parse(readFileSync(mock, 'utf8')); }
-  if (!TOKEN) { avisos.push('no hay APIGATEWAY_TOKEN: se omiten los indicadores previsionales'); return null; }
+  if (!TOKEN) {
+    const sin = 'no hay APIGATEWAY_TOKEN: se omiten los indicadores previsionales';
+    if (!avisos.includes(sin)) avisos.push(sin);       // se consulta más de un período: basta un aviso
+    return null;
+  }
   const url = `https://apigateway.cl/api/v2/previred/indicadores/data/${periodo}`;
   const r = await fetch(url, { headers: { Authorization: `Token ${TOKEN}` } });
   if (!r.ok) throw new Error(`la API respondió ${r.status} para el período ${periodo}`);

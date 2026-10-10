@@ -16,7 +16,11 @@ vez publicada se instala como aplicación y abre sin conexión.
 | `EMPEZAR.md` | Los pasos para dejarlo andando. Parte por ahí. |
 | `parametros.json` | Tabla de tasas y topes. El robot la mantiene al día. La app la encuentra sola. |
 | `robot/actualizar.mjs` | El robot que lee las fuentes y actualiza la tabla. |
+| `robot/cargar.mjs` | El robot de carga: procesa las carpetas de clientes de `entrada/`. |
+| `robot/probar.mjs` | Las pruebas del robot y de los lectores de la app, con archivos inventados. |
 | `.github/workflows/actualizar-parametros.yml` | Lo que hace correr al robot dos veces al mes. |
+| `.github/workflows/cargar-clientes.yml` | Procesa `entrada/` cada vez que subes archivos de clientes. |
+| `.github/workflows/probar.yml` | Corre las pruebas cada vez que cambia `index.html` o el robot. |
 | `icon-192.png`, `icon-512.png`, `icon-maskable-512.png`, `apple-touch-icon.png` | Íconos. |
 
 ## Publicarla
@@ -42,9 +46,51 @@ internet.
 ## Publicar cambios
 
 Cuando modifiques `index.html`, sube también `sw.js` con la versión del cache
-cambiada (la primera línea, `cuadratura-v1` → `cuadratura-v2`). Si no la
-cambias, los dispositivos que ya la tienen instalada pueden seguir abriendo la
-versión vieja.
+cambiada (la línea `const CACHE`, por ejemplo `cuadratura-v3` → `cuadratura-v4`).
+Si no la cambias, los dispositivos que ya la tienen instalada pueden seguir
+abriendo la versión vieja.
+
+## Qué cambió en la versión 2
+
+**Lectura de archivos**
+
+- **Excel:** las celdas vacías con formato ya no corren los números de
+  columna, y las filas de totales (*Total*, *Sumas*, *Totales*) no se suman
+  como si fueran cuentas.
+- **Varias empresas en una planilla:** si el balance trae una columna
+  *Empresa* o *Sociedad*, la app toma sola la que coincide con el nombre en
+  Ajustes y deja elegir otra desde una lista.
+- **PDF:** lee los PDF que generan los sistemas contables y los bancos
+  (fuentes con mapa de caracteres, objetos comprimidos, tablas de varias
+  columnas y de varias páginas). Si una página es una imagen escaneada, lo
+  dice con el número de página en vez de devolver una tabla vacía.
+- **Cartolas:** acepta fechas sin año (`15/06`), con el mes en palabras
+  (`5 de junio de 2026`), movimientos en orden descendente y montos con el
+  signo al final (`12.500-`). Revisa el saldo fila a fila y avisa la fecha
+  exacta donde no calza con los movimientos.
+
+**Gráficos** (se dibujan en la misma app, sin conexión; al pasar el mouse
+muestran el monto exacto):
+
+| Dónde | Qué muestra |
+|---|---|
+| Panel | Ingresos y gastos de cada mes y el resultado, con una frase que lo explica. |
+| Balance | Lo que tiene la empresa y cómo lo financia (activo frente a pasivo y patrimonio). |
+| Banco | El saldo de la cuenta día a día, con el punto más bajo marcado. |
+| F29 | IVA débito frente a crédito por mes y el remanente que se arrastra. |
+| Informe para el cliente | El gráfico del panel y el de la estructura del balance. |
+
+**Robot de carga**
+
+- Distingue un balance de comprobación (debe y haber, sin fechas) de un libro
+  diario. Antes lo leía como diario e inventaba asientos.
+- Con varias empresas en un archivo carga solo la que corresponde, y si
+  ninguna coincide con `empresa.json` no adivina: falla y lo explica.
+- Salta las hojas que son un estado financiero armado desde otra hoja.
+- Informa las páginas escaneadas de un PDF, los saltos de saldo de las cartolas,
+  y qué empresa quedó con errores (esa queda sin informe).
+- Tiene pruebas: `node robot/probar.mjs`. GitHub las corre solo en cada cambio,
+  y los workflows usan Node 24 (Node 20 dejó de recibir soporte en abril de 2026).
 
 ## Los datos
 
