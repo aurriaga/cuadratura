@@ -50,6 +50,102 @@ cambiada (la línea `const CACHE`, por ejemplo `cuadratura-v3` → `cuadratura-v
 Si no la cambias, los dispositivos que ya la tienen instalada pueden seguir
 abriendo la versión vieja.
 
+## Qué cambió en la versión 4
+
+Una pestaña nueva, **Análisis**, con cuatro vistas. Todas usan el mismo corte
+del Balance y cada una se exporta en CSV con la misma cifra de control.
+
+**Centros de costo**
+
+- Se crean en Ajustes (código y nombre: sucursal, proyecto, área).
+- Se asignan al registrar un documento y en cada línea de resultado del
+  asiento manual. Si importas un libro diario con una columna «Centro de
+  costo», se asignan solos y los que no existen se crean.
+- Análisis › Centros de costo muestra ingresos, costos, gastos, resultado y
+  margen de cada centro. La suma de los centros es el resultado del estado de
+  resultados, y se avisa qué parte de los gastos no tiene centro.
+
+**Estados comparativos**
+
+- Acumulado del año contra el mismo período del año anterior, o mes contra
+  mes anterior, con variación en pesos y en porcentaje.
+- El estado de situación se compara contra el 31 de diciembre anterior.
+- El año anterior sale de sus asientos: importa su libro diario y la app lo
+  separa por año. Si no está, la columna queda vacía y se avisa.
+- También el estado de resultados mes a mes, de enero al corte.
+
+**Flujo de caja**
+
+- Método directo (NIIF PYMES sección 7): cada movimiento de caja y banco se
+  ordena en operación, inversión o financiamiento según la cuenta del otro
+  lado del asiento. Los saldos de apertura son el saldo inicial, y el
+  traspaso entre caja y banco no cuenta como flujo.
+- El saldo final se controla contra el mayor de caja y banco.
+- Posición de caja: lo que hay, más lo que falta cobrar, menos lo que falta
+  pagar (según los auxiliares), sueldos por pagar y el F29 que vence.
+
+**Gráficos**
+
+- Panel: caja mes a mes, antigüedad de lo que deben los clientes y en qué
+  se va la plata (gastos principales).
+- Cada vista de Análisis trae su gráfico con una lectura en palabras.
+- El informe para el dueño suma el flujo de caja con su gráfico.
+
+## Qué cambió en la versión 3
+
+Cuatro cosas que traen los sistemas contables (Defontana, Softland, Nubox) y
+que le faltaban a la app.
+
+**Comprobantes numerados por tipo**
+
+- Cada asiento es ahora un comprobante de **Ingreso**, **Egreso** o
+  **Traspaso**, con folio correlativo propio por año. El tipo se deduce solo:
+  Ingreso si entra plata a caja o banco, Egreso si sale, Traspaso si no la
+  toca. En el asiento manual se puede elegir a mano.
+- Un folio borrado no se vuelve a usar: queda como *anulado* en la bitácora,
+  con su monto, así que cada salto en la numeración tiene explicación.
+- El Diario filtra por tipo y cada comprobante se puede imprimir con espacio
+  para las firmas (preparado, revisado, aprobado).
+- Los respaldos antiguos se numeran solos la primera vez que se abren, en
+  orden de fecha.
+
+**Cierre de períodos** (Cierre › Períodos)
+
+- Un mes cerrado no acepta documentos ni comprobantes nuevos con esa fecha,
+  y no deja borrar los que tiene. Así el F29 y el balance que ya entregaste
+  no cambian por debajo.
+- Antes de cerrar se revisa: que todos los comprobantes cuadren (si no, no
+  deja cerrar), que cada documento tenga asiento, la cartola conciliada, el
+  IVA y la depreciación asentados, y que el mes anterior esté cerrado.
+- Reabrir pide un motivo, y queda anotado en la bitácora junto con el cierre.
+
+**Auxiliar de clientes y proveedores por RUT** (pestaña Auxiliares)
+
+- Saldo de cada cliente y proveedor con antigüedad en tramos de 0–30,
+  31–60, 61–90, 91–180 y más de 180 días. Un RUT escrito con o sin puntos
+  es la misma contraparte.
+- Descuenta los cobros y pagos conciliados en Banco y los que se registran
+  desde el mismo auxiliar (que arman su asiento y quedan amarrados al
+  documento, también para pagos parciales).
+- Se controla contra la cuenta 1103 y la 2101 al mismo corte, y explica de
+  dónde suele salir la diferencia.
+
+**Una sola fuente para ver, imprimir y exportar**
+
+- El balance, los estados financieros, el informe para el dueño y todos los
+  archivos exportados salen del **mismo corte** (el que eliges en Balance) y
+  de las mismas filas. Antes el CSV del diario traía el año entero aunque el
+  balance estuviera al mes.
+- Se corrigió que los estados escondieran cuentas sin subgrupo (por ejemplo
+  un gasto nuevo) mientras sí las sumaban en los totales: ahora toda cuenta
+  que suma aparece en su grupo.
+- Nuevos archivos CSV: balance de 8 columnas, estados financieros, libro
+  diario, libro mayor y auxiliar. Cada uno lleva en el encabezado la **cifra
+  de control** (cantidad de asientos y suma del Debe); el informe la trae en
+  el pie. Si dos salidas tienen la misma cifra, sus montos cuadran.
+- Si las ventas del F29 (documentos) no calzan con los ingresos contables,
+  el balance y el informe lo dicen y explican por qué.
+
 ## Qué cambió en la versión 2
 
 **Lectura de archivos**

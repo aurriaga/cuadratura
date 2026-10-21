@@ -99,9 +99,13 @@ export function montarEntorno(raiz = RAIZ){
       'detectarDelim','parseCSV','filasATexto','generarInforme','nombreInforme','urlInforme',
       'qrSVG','cuadraDiario','esf','eri','asientosDelEjercicio','fmt','emparejar',
       'informeConciliacion','registrarDoc','addAsiento','uid','saldos','CTA','PLAN_ACT',
-      'numCSV','fechaISO']
+      'numCSV','fechaISO','borrarAsiento','borrarDoc','tipoComprobante','etiquetaCbte','periodoCerrado',
+      'revisionPeriodo','bloqueos','auxiliar','pendienteDoc','registrarPagoDoc','corte','EXPORTES',
+      'filasEEFF','controlVentas','balance8','flujoCaja','posicionCaja','comparativo','periodosComparados',
+      'resultadoPorCentro','eriMensual','centroDesdeTexto','eri']
       .forEach(k=>{ try{ salida[k] = eval(k); }catch(e){} });
     salida.fijarS = v => { S = v; };
+    salida.leerS = () => S;
   `);
   fn(api);
   return api;

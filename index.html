@@ -554,6 +554,12 @@ function migrar(g){
   S2.cm = Object.assign({cpi:0, ipc:{}, movs:[], otrosActivos:0, otrosPasivos:0}, g.cm||{});
   if(!S2.par.uf) S2.par.uf = base.par.uf;
   if(!S2.par.utm) S2.par.utm = base.par.utm;
+  S2.cierres = Object.assign({}, g.cierres||{});
+  S2.folios = Object.assign({}, g.folios||{});
+  if(!Array.isArray(S2.bitacora)) S2.bitacora = [];
+  if(!Array.isArray(S2.centros)) S2.centros = [];
+  if(!Array.isArray(S2.asientos)) S2.asientos = [];
+  numerarExistentes(S2);
   return S2;
 }
 function estadoInicial(){
@@ -572,7 +578,7 @@ function estadoInicial(){
     plan:[], activos:[],
     compartir:{base:'', documentos:false, tributario:true, nota:''},
     cm:{cpi:0, ipc:{}, movs:[], otrosActivos:0, otrosPasivos:0},
-    docs:[], asientos:[], correlativo:1,
+    docs:[], asientos:[], correlativo:1, folios:{}, cierres:{}, bitacora:[], centros:[],
     banco:{cuenta:'1102', saldoInicial:0, movs:[], reglas:{}, mapaGuardado:null},
     ajustes:{gastosRechazados:0, ingresosNoRenta:0, otros:0, reinversion:0, creditos:0, retirosDueno:0},
     ui:{mes:new Date().getMonth(), ano:a, vista:'panel', ctaMayor:'1102', filtroDoc:'todos'}
@@ -717,15 +723,78 @@ function esf(lista){
           total:G.pc+G.pnc+G.cap+G.uac-G.ret+res, fuera};
 }
 
-function addAsiento(fecha, glosa, lineas, origen, docId){
-  const ls = lineas.filter(l=>l.c && (num(l.d)>0||num(l.h)>0)).map(l=>({c:l.c,d:R(num(l.d)),h:R(num(l.h))}));
+// tipo: 'I', 'E' o 'T' para forzar el tipo de comprobante; si no viene, se deduce.
+function addAsiento(fecha, glosa, lineas, origen, docId, tipo){
+  const ls = lineas.filter(l=>l.c && (num(l.d)>0||num(l.h)>0)).map(l=>{
+    const x = {c:l.c, d:R(num(l.d)), h:R(num(l.h))};
+    if(l.cc && esResultado(l.c)) x.cc = l.cc;          // el centro de costo solo tiene sentido en cuentas de resultado
+    return x;
+  });
   if(!ls.length) return null;
+  if(periodoCerrado(fecha)) return bloquear(fecha, glosa);
   const a = {id:uid(), n:S.correlativo++, fecha, glosa, origen:origen||'manual', doc:docId||null, lineas:ls};
+  asignarFolio(a, TIPOS_CBTE[tipo] ? tipo : tipoComprobante(ls));
   S.asientos.push(a);
   S.asientos.sort((x,y)=> x.fecha===y.fecha ? x.n-y.n : (x.fecha<y.fecha?-1:1));
   return a;
 }
-function borrarAsiento(id){ S.asientos = S.asientos.filter(a=>a.id!==id); }
+// El folio de un comprobante borrado no se vuelve a usar: queda en la bitácora
+// como anulado, con su monto, para que el salto en la numeración se explique.
+function borrarAsiento(id){
+  const a = S.asientos.find(x=>x.id===id); if(!a) return false;
+  if(periodoCerrado(a.fecha)){ bloquear(a.fecha, a.glosa); return false; }
+  anotar('anulado', etiquetaCbte(a) + ' del ' + a.fecha + ' · ' + (a.glosa||'') + ' · $ ' + fmt(totalAsiento(a)),
+         {tipo:a.tipo, folio:a.folio, fecha:a.fecha});
+  S.asientos = S.asientos.filter(x=>x.id!==id);
+  return true;
+}
+const totalAsiento = a => a.lineas.reduce((t,l)=>t+num(l.d),0);
+
+/* ---------------------- 5b. comprobantes, períodos y bitácora --------- */
+// Como en los sistemas contables chilenos, cada asiento es un comprobante con
+// tipo y folio correlativo por año: Ingreso si entra plata a caja o banco,
+// Egreso si sale, Traspaso si no la toca (o si solo se mueve entre caja y banco).
+const TIPOS_CBTE = {I:'Ingreso', E:'Egreso', T:'Traspaso'};
+function ctasDisponible(){ return new Set(['1101','1102', S.banco && S.banco.cuenta].filter(Boolean)); }
+function tipoComprobante(lineas){
+  const disp = ctasDisponible(); let entra = 0, sale = 0;
+  lineas.forEach(l=>{ if(disp.has(l.c)){ entra += num(l.d); sale += num(l.h); } });
+  if(R(entra) === R(sale)) return 'T';
+  return entra > sale ? 'I' : 'E';
+}
+function asignarFolio(a, tipo, st){
+  st = st || S;
+  const ano = a.fecha.slice(0,4);
+  st.folios = st.folios || {};
+  const f = st.folios[ano] = Object.assign({I:0, E:0, T:0}, st.folios[ano]);
+  a.tipo = tipo; a.folio = ++f[tipo];
+}
+function etiquetaCbte(a){ return a.tipo ? TIPOS_CBTE[a.tipo] + ' N° ' + a.folio : 'Asiento N° ' + a.n; }
+function cbteCorto(a){ return a.tipo ? a.tipo + '-' + a.folio : String(a.n); }
+// Los respaldos anteriores a los folios se numeran una sola vez, en orden de fecha.
+function numerarExistentes(st){
+  const sin = st.asientos.filter(a=>!a.tipo);
+  sin.slice().sort((x,y)=> x.fecha===y.fecha ? x.n-y.n : (x.fecha<y.fecha?-1:1))
+     .forEach(a=> asignarFolio(a, tipoComprobante(a.lineas), st));
+  return sin.length;
+}
+
+// Un mes cerrado no admite asientos ni documentos nuevos, ni borrar los que
+// tiene: así el F29 y el balance que ya entregaste no cambian por debajo.
+// Se reabre desde Cierre › Períodos, y la reapertura queda en la bitácora.
+function periodoCerrado(fecha){ return !!(S.cierres && fecha && S.cierres[ymOf(fecha)]); }
+const bloqueos = [];
+function bloquear(fecha, que){ bloqueos.push({ym: ymOf(fecha), que: que||''}); return null; }
+function textoBloqueos(){
+  if(!bloqueos.length) return '';
+  const meses = [...new Set(bloqueos.map(b=>b.ym))].map(ym=>MESES[+ym.slice(5)-1]+' '+ym.slice(0,4));
+  return (bloqueos.length===1 ? 'No se grabó: ' : bloqueos.length+' operaciones no se grabaron: ')
+       + meses.join(', ') + (meses.length===1 ? ' está cerrado.' : ' están cerrados.') + ' Reábrelo en Cierre › Períodos.';
+}
+function anotar(accion, detalle, extra){
+  S.bitacora = S.bitacora || [];
+  S.bitacora.push(Object.assign({cuando: new Date().toISOString(), accion, detalle}, extra||{}));
+}
 
 /* ---------------------- 6. documento -> asiento ----------------------- */
 function asientoDeDoc(d){
@@ -738,12 +807,12 @@ function asientoDeDoc(d){
     if(!nc){
       const ing = d.neto + d.exento;
       L.push({c:cli, d:d.total});
-      if(ing)   L.push({c:d.cuenta, h:ing});
+      if(ing)   L.push({c:d.cuenta, h:ing, cc:d.cc});
       if(d.iva) L.push({c:'2103', h:d.iva});
       if(d.ila) L.push({c:'2109', h:d.ila});
     }else{
       const ing = d.neto + d.exento;
-      if(ing)   L.push({c:d.cuenta, d:ing});
+      if(ing)   L.push({c:d.cuenta, d:ing, cc:d.cc});
       if(d.iva) L.push({c:'2103', d:d.iva});
       if(d.ila) L.push({c:'2109', d:d.ila});
       L.push({c:cli, h:d.total});
@@ -753,41 +822,243 @@ function asientoDeDoc(d){
     const sinCred = !d.creditoIva;
     const cargo = d.neto + d.exento + (sinCred ? d.iva + d.ila : 0);
     if(!nc){
-      if(cargo) L.push({c:d.cuenta, d:cargo});
+      if(cargo) L.push({c:d.cuenta, d:cargo, cc:d.cc});
       if(!sinCred && d.iva) L.push({c:'1106', d:d.iva});
       if(!sinCred && d.ila) L.push({c:'1110', d:d.ila});
       L.push({c:prov, h:d.total});
     }else{
       L.push({c:prov, d:d.total});
-      if(cargo) L.push({c:d.cuenta, h:cargo});
+      if(cargo) L.push({c:d.cuenta, h:cargo, cc:d.cc});
       if(!sinCred && d.iva) L.push({c:'1106', h:d.iva});
       if(!sinCred && d.ila) L.push({c:'1110', h:d.ila});
     }
   } else { // honorario recibido
-    L.push({c:d.cuenta||'5109', d:d.neto});
+    L.push({c:d.cuenta||'5109', d:d.neto, cc:d.cc});
     if(d.retencion) L.push({c:'2105', h:d.retencion});
     L.push({c: ctaPago || '2101', h: d.neto - d.retencion});
   }
   return {glosa, lineas:L};
 }
 function registrarDoc(d){
+  if(periodoCerrado(d.fecha)){ bloquear(d.fecha, 'documento '+(d.folio||'')); return false; }
   const a = asientoDeDoc(d);
   const as = addAsiento(d.fecha, a.glosa, a.lineas, 'doc', d.id);
   d.asientos = as ? [as.id] : [];
   // costo de venta, asiento separado (inventario permanente)
   if(d.clase==='venta' && S.emp.inventarioPermanente && num(d.costo)>0){
     const c = R(num(d.costo));
-    const l = d.nc ? [{c:'1105',d:c},{c:'5101',h:c}] : [{c:'5101',d:c},{c:'1105',h:c}];
+    const l = d.nc ? [{c:'1105',d:c},{c:'5101',h:c,cc:d.cc}] : [{c:'5101',d:c,cc:d.cc},{c:'1105',h:c}];
     const a2 = addAsiento(d.fecha, (d.nc?'Reverso costo ':'Costo de venta ')+(d.folio?('N° '+d.folio):''), l, 'doc', d.id);
     if(a2) d.asientos.push(a2.id);
   }
   S.docs.push(d);
   S.docs.sort((x,y)=> x.fecha<y.fecha?-1:1);
+  return true;
 }
 function borrarDoc(id){
-  const d = S.docs.find(x=>x.id===id); if(!d) return;
-  (d.asientos||[]).forEach(borrarAsiento);
+  const d = S.docs.find(x=>x.id===id); if(!d) return false;
+  // Si el documento o alguno de sus asientos cae en un mes cerrado, no se toca nada.
+  const suyos = S.asientos.filter(a=>(d.asientos||[]).includes(a.id) || pagosDoc(d).some(p=>p.aid===a.id && p.origen==='manual'));
+  const cerrado = [d].concat(suyos).find(x=>periodoCerrado(x.fecha));
+  if(cerrado){ bloquear(cerrado.fecha, 'documento '+(d.folio||'')); return false; }
+  suyos.forEach(a=>borrarAsiento(a.id));
   S.docs = S.docs.filter(x=>x.id!==id);
+  return true;
+}
+
+/* ---------------------- 6b. auxiliar de clientes y proveedores -------- */
+// Cuenta corriente por RUT con antigüedad de saldos. Parte de los documentos
+// a crédito y les descuenta los cobros o pagos: los que se concilian en Banco
+// y los que se registran desde el propio auxiliar. Se controla contra el
+// saldo contable de Clientes (1103) y Proveedores (2101) al mismo corte.
+function normRut(r){ return String(r||'').toUpperCase().replace(/[^0-9K]/g,'').replace(/^0+/,''); }
+function fmtRut(r){
+  const t = normRut(r); if(t.length < 2) return String(r||'');
+  return Number(t.slice(0,-1)).toLocaleString('es-CL') + '-' + t.slice(-1);
+}
+// Lo que el documento deja por cobrar o pagar: el total, o lo líquido en honorarios.
+function montoDoc(d){ return d.clase==='honorario' ? num(d.neto) - num(d.retencion) : num(d.total); }
+function pagosDoc(d, hasta){
+  const L = (d.pagos||[]).map(p=>({fecha:p.fecha, monto:num(p.monto), aid:p.aid, origen:'manual'}));
+  ((S.banco && S.banco.movs)||[]).forEach(m=>{
+    if(m.docId===d.id && m.aid) L.push({fecha:m.fecha, monto:Math.abs(num(m.monto)), aid:m.aid, origen:'banco'});
+  });
+  // un pago cuenta solo si su asiento sigue en el diario
+  return L.filter(p=> S.asientos.some(a=>a.id===p.aid) && (!hasta || p.fecha<=hasta));
+}
+function pendienteDoc(d, hasta){
+  if(d.condicion!=='credito') return 0;
+  if(d.nc) return -montoDoc(d);              // la nota de crédito rebaja la deuda de esa contraparte
+  return montoDoc(d) - pagosDoc(d, hasta).reduce((t,p)=>t+p.monto,0);
+}
+const TRAMOS_AUX = [[30,'0 a 30 días'],[60,'31 a 60'],[90,'61 a 90'],[180,'91 a 180'],[Infinity,'Más de 180']];
+function auxiliar(lado, hasta){
+  const clases = lado==='cli' ? ['venta'] : ['compra','honorario'];
+  const M = {}, T = {total:0, docs:0, tramos:TRAMOS_AUX.map(()=>0)};
+  S.docs.filter(d=>clases.includes(d.clase) && d.fecha<=hasta).forEach(d=>{
+    const p = R(pendienteDoc(d, hasta));
+    if(Math.abs(p) <= 1) return;
+    const rut = normRut(d.rut), k = rut || 'sin:' + normCab(d.contraparte||'sin nombre');
+    const g = M[k] = M[k] || {k, rut, nombre:d.contraparte||'(sin nombre)', docs:[], total:0, tramos:TRAMOS_AUX.map(()=>0), maxDias:0};
+    const dias = Math.round(diasEntre(d.fecha, hasta));
+    const i = TRAMOS_AUX.findIndex(t=>dias<=t[0]);
+    g.docs.push({d, p, dias, pagado: montoDoc(d) - (d.nc ? 0 : p)});
+    g.total += p; g.tramos[i] += p; g.maxDias = Math.max(g.maxDias, p>0 ? dias : 0);
+    T.total += p; T.tramos[i] += p; T.docs++;
+  });
+  const filas = Object.values(M).sort((a,b)=>b.total-a.total);
+  const m = saldos(asientosDelEjercicio().filter(a=>a.fecha<=hasta));
+  const cta = lado==='cli' ? '1103' : '2101';
+  const contable = m[cta] ? (lado==='cli' ? m[cta].debe-m[cta].haber : m[cta].haber-m[cta].debe) : 0;
+  return {lado, hasta, cta, filas, T, contable, dif: R(T.total - contable)};
+}
+// Cobro o pago registrado desde el auxiliar: arma el asiento y lo amarra al documento.
+function registrarPagoDoc(d, fecha, monto, ctaDisp){
+  monto = R(num(monto));
+  if(monto<=0) return null;
+  const cta = d.clase==='venta' ? '1103' : '2101';
+  const l = d.clase==='venta' ? [{c:ctaDisp, d:monto},{c:cta, h:monto}] : [{c:cta, d:monto},{c:ctaDisp, h:monto}];
+  const g = (d.clase==='venta'?'Cobro ':'Pago ') + dteAbr(d.dte) + ' N° ' + (d.folio||'') + ' ' + (d.contraparte||'');
+  const a = addAsiento(fecha, g.trim(), l, 'aux', d.id);
+  if(a){ d.pagos = d.pagos || []; d.pagos.push({fecha, monto, aid:a.id}); }
+  return a;
+}
+
+/* ---------------------- 6c. centros de costo -------------------------- */
+// Se asignan en la línea del asiento, solo en cuentas de resultado: así cada
+// ingreso y cada gasto se puede ver por sucursal, proyecto o área.
+function esResultado(c){ const t = CTA[c]; return !!t && (t.tipo==='ingreso' || t.tipo==='gasto'); }
+function nomCentro(cod){ const x = (S.centros||[]).find(c=>c[0]===cod); return x ? x[1] : cod ? '(centro ' + cod + ')' : 'Sin centro'; }
+// Un libro importado trae el centro como texto: se busca por código o nombre, y si no existe se crea.
+function centroDesdeTexto(t){
+  t = String(t||'').trim(); if(!t) return '';
+  S.centros = S.centros || [];
+  const n = normCab(t);
+  const x = S.centros.find(c=>normCab(c[0])===n || normCab(c[1])===n);
+  if(x) return x[0];
+  const cod = t.toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,10) || 'CC' + (S.centros.length+1);
+  S.centros.push([cod, t]);
+  return cod;
+}
+function centroEnUso(cod){ return S.asientos.some(a=>a.lineas.some(l=>l.cc===cod)) || S.docs.some(d=>d.cc===cod); }
+function resultadoPorCentro(lista){
+  const cols = (S.centros||[]).map(c=>c[0]).concat(['']);
+  const M = {}, T = {};
+  cols.forEach(k=> T[k] = {ing:0, costo:0, gasto:0});
+  lista.forEach(a=>a.lineas.forEach(l=>{
+    const t = CTA[l.c]; if(!t || (t.tipo!=='ingreso' && t.tipo!=='gasto')) return;
+    const k = cols.includes(l.cc||'') ? (l.cc||'') : '';
+    const v = t.tipo==='ingreso' ? num(l.h) - num(l.d) : num(l.d) - num(l.h);
+    (M[l.c] = M[l.c] || {})[k] = (M[l.c][k]||0) + v;
+    if(t.tipo==='ingreso') T[k].ing += v; else if(t.sub==='costo') T[k].costo += v; else T[k].gasto += v;
+  }));
+  cols.forEach(k=>{ T[k].res = T[k].ing - T[k].costo - T[k].gasto; });
+  const usados = cols.filter(k=> k==='' ? (T[''].ing||T[''].costo||T[''].gasto) : true);
+  const ctas = Object.keys(M).sort((a,b)=> (CTA[a].tipo===CTA[b].tipo ? (a<b?-1:1) : CTA[a].tipo==='ingreso'?-1:1));
+  return {cols: usados, ctas, M, T};
+}
+
+/* ---------------------- 6d. comparativos y flujo de caja -------------- */
+// El año anterior se toma de los asientos de ese año que estén cargados (por
+// ejemplo importando su libro diario). Sin ellos la columna queda vacía y se avisa.
+function asientosAnoHasta(fecha){ const y = fecha.slice(0,4); return S.asientos.filter(a=>a.fecha.slice(0,4)===y && a.fecha<=fecha); }
+function asientosEntre(desde, hasta){ return S.asientos.filter(a=>a.fecha>=desde && a.fecha<=hasta); }
+function mesAnterior(ym){ let [y,m] = ym.split('-').map(Number); m--; if(!m){ m=12; y--; } return y+'-'+String(m).padStart(2,'0'); }
+function nomMes(ym){ return MESES[+ym.slice(5)-1] + ' ' + ym.slice(0,4); }
+// La misma forma de filas para varios períodos: así quedan alineadas, cuenta por cuenta.
+function formaEEFF(listas){
+  const f = {cods:new Set(), pnc:false, otrosIng:false, fin:false, imp:false};
+  listas.forEach(l=>{
+    const m = saldos(l), E = esf(l), r = eri(l);
+    Object.keys(m).forEach(c=>{ if(R(m[c].debe - m[c].haber)!==0) f.cods.add(c); });
+    f.pnc = f.pnc || !!R(E.pnc); f.otrosIng = f.otrosIng || !!R(r.otrosIng);
+    f.fin = f.fin || !!R(r.fin); f.imp = f.imp || !!R(r.imp);
+  });
+  return f;
+}
+// periodos = [{tit, esf:lista hasta la fecha, eri:lista del período}]
+function comparativo(periodos){
+  const fe = formaEEFF(periodos.map(p=>p.esf)), fr = formaEEFF(periodos.map(p=>p.eri));
+  const F = periodos.map(p=>({esf: filasEEFF(p.esf, fe).esf, eri: filasEEFF(p.eri, fr).eri, vacio: !p.eri.length && !p.esf.length}));
+  const juntar = k => F[0][k].map((f, i)=>Object.assign({}, f, {vs: F.map(x=>x[k][i].v)}));
+  return {tits: periodos.map(p=>p.tit), vacios: F.map(x=>x.vacio), esf: juntar('esf'), eri: juntar('eri')};
+}
+function periodosComparados(modo){
+  const C = corte(), ej = S.emp.ejercicio;
+  if(modo === 'mes'){
+    const ym = C.todo ? ej+'-12' : C.ym, ant = mesAnterior(ym);
+    return [{tit: nomMes(ym), esf: asientosAnoHasta(finDeMes(ym)), eri: asientosEntre(ym+'-01', finDeMes(ym))},
+            {tit: nomMes(ant), esf: asientosAnoHasta(finDeMes(ant)), eri: asientosEntre(ant+'-01', finDeMes(ant))}];
+  }
+  const finAnt = (ej-1) + C.hasta.slice(4);
+  return [{tit: 'Ene–' + MESES[C.mesIdx].slice(0,3) + ' ' + ej, esf: C.lista, eri: C.lista},
+          {tit: 'Ene–' + MESES[C.mesIdx].slice(0,3) + ' ' + (ej-1), esf: asientosAnoHasta((ej-1)+'-12-31'), eri: asientosAnoHasta(finAnt)}];
+}
+function variacion(a, b){ const d = a - b; return {d, p: b ? d/Math.abs(b) : null}; }
+
+// Flujo de caja por el método directo: cada asiento que mueve caja o banco se
+// abre según la cuenta del otro lado. Las líneas que no son caja suman, con su
+// signo, exactamente lo que se movió en caja, así que el flujo cuadra solo con
+// el saldo del mayor. Los saldos de apertura no son flujo: son el saldo inicial.
+const SECC_FLUJO = [['op','Actividades de operación'],['inv','Actividades de inversión'],['fin','Actividades de financiamiento']];
+const IVA_FLUJO = ['2103','1106','2109','1110'];
+function categoriaFlujo(c){
+  const t = CTA[c];
+  if(!t) return ['op','Otros movimientos de operación'];
+  if((t.tipo==='activo'||t.tipo==='activoC') && t.clase==='nc') return ['inv','Compra y venta de activo fijo'];
+  if(t.tipo==='pasivo' && t.clase==='nc') return ['fin','Préstamos de largo plazo'];
+  if(t.tipo==='patrimonio') return ['fin','Aportes de capital'];
+  if(t.tipo==='patrimonioD') return ['fin','Retiros de los dueños'];
+  if(['2104','2106','2107','5102','5111','5113'].includes(c)) return ['op','Pagos al personal'];
+  if(['2103','2105','2109','2110','1106','1108','1110'].includes(c) || t.sub==='impuesto') return ['op','Impuestos (IVA, PPM, retenciones, renta)'];
+  if(t.sub==='financiero') return ['op','Intereses pagados'];
+  if(t.tipo==='ingreso' || ['1103','1104','1109','2108'].includes(c)) return ['op','Cobros a clientes'];
+  return ['op','Pagos a proveedores y gastos'];
+}
+function flujoCaja(C){
+  const ej = String(S.emp.ejercicio), n = C.mesIdx + 1, disp = ctasDisponible();
+  const S0 = {}, cero = () => new Array(n).fill(0);
+  SECC_FLUJO.forEach(([k])=> S0[k] = {lineas:{}, tot:cero()});
+  let inicial = 0;
+  S.asientos.filter(a=>a.fecha.slice(0,4)===ej && a.fecha<=C.hasta).forEach(a=>{
+    const cash = a.lineas.filter(l=>disp.has(l.c));
+    if(!cash.length) return;
+    if(a.origen==='apertura'){ cash.forEach(l=> inicial += num(l.d) - num(l.h)); return; }
+    const m = +a.fecha.slice(5,7) - 1;
+    // El IVA que viene dentro de una venta o compra al contado va con ella, igual
+    // que cuando se cobra o paga una factura a crédito: el cobro incluye el IVA.
+    const otras = a.lineas.filter(l=>!disp.has(l.c) && !IVA_FLUJO.includes(l.c));
+    const principal = otras.length ? otras.reduce((x, l)=> num(l.d)+num(l.h) > num(x.d)+num(x.h) ? l : x) : null;
+    a.lineas.forEach(l=>{
+      if(disp.has(l.c)) return;
+      const cat = IVA_FLUJO.includes(l.c) && principal ? principal.c : l.c;
+      const [k, nom] = categoriaFlujo(cat), v = num(l.h) - num(l.d);
+      const L = S0[k].lineas[nom] = S0[k].lineas[nom] || cero();
+      L[m] += v; S0[k].tot[m] += v;
+    });
+  });
+  const neto = cero().map((_, i)=> SECC_FLUJO.reduce((t,[k])=>t + S0[k].tot[i], 0));
+  const ini = [], fin = [];
+  neto.forEach((v, i)=>{ ini.push(i ? fin[i-1] : inicial); fin.push(ini[i] + v); });
+  const m = saldos(C.lista); let mayor = 0;
+  disp.forEach(c=>{ if(m[c]) mayor += m[c].debe - m[c].haber; });
+  const sum = v => v.reduce((a,b)=>a+b, 0);
+  return {n, secc:S0, neto, ini, fin, inicial, mayor:R(mayor), dif: R(fin[n-1] - mayor),
+          total: {op:sum(S0.op.tot), inv:sum(S0.inv.tot), fin:sum(S0.fin.tot), neto:sum(neto)}};
+}
+// Lo que la caja de hoy tiene comprometido: por cobrar, por pagar y el F29 que vence.
+function posicionCaja(C, FC){
+  const cli = auxiliar('cli', C.hasta), pro = auxiliar('pro', C.hasta), m = saldos(C.lista);
+  const acr = c => m[c] ? m[c].haber - m[c].debe : 0;
+  const f = f29Ano()[C.mesIdx];
+  const filas = [
+    {n:'Caja y banco al ' + C.hasta, v:FC.fin[FC.n-1]},
+    {n:'Más: por cobrar a clientes (auxiliar)', v:cli.T.total},
+    {n:'Menos: por pagar a proveedores (auxiliar)', v:-pro.T.total},
+    {n:'Menos: sueldos y cotizaciones por pagar', v:-(acr('2104') + acr('2106'))},
+    {n:'Menos: F29 de ' + MESES[C.mesIdx] + ' (vence el mes siguiente)', v:-(f ? f.total : 0)}
+  ];
+  return {filas, neto: filas.reduce((t,x)=>t + x.v, 0)};
 }
 
 /* ---------------------- 7. circuito tributario: F29 ------------------- */
@@ -2279,7 +2550,7 @@ function confirmarImport(an, cuenta, creditoIva){
       ilaTasa:0, condicion:'credito', cuenta:cuenta,
       creditoIva: an.clase==='compra' ? (creditoIva && d.iva>0) : false,
       costo:0, nc:d.nc, importado:true};
-    registrarDoc(doc); n++;
+    if(registrarDoc(doc)) n++;
   });
   return n;
 }
@@ -2498,17 +2769,16 @@ function movimientosLibro(){
   const out = [];
   asientosDelEjercicio().forEach(a=> a.lineas.forEach(l=>{
     if(l.c !== S.banco.cuenta) return;
-    out.push({aid:a.id, n:a.n, fecha:a.fecha, glosa:a.glosa, monto: num(l.d) - num(l.h)});
+    out.push({aid:a.id, n:cbteCorto(a), fecha:a.fecha, glosa:a.glosa, monto: num(l.d) - num(l.h)});
   }));
   return out.sort((a,b)=> a.fecha<b.fecha?-1:1);
 }
 const diasEntre = (a,b) => Math.abs((new Date(a+'T12:00:00') - new Date(b+'T12:00:00'))/86400000);
 const soloDig = t => String(t||'').replace(/\D/g,'');
 
-// Documentos que todavía no tienen pago o cobro registrado.
+// Documentos con saldo por cobrar o pagar (el mismo cálculo del auxiliar).
 function docsPendientes(){
-  const pagados = new Set((S.banco.movs||[]).filter(m=>m.docId).map(m=>m.docId));
-  return S.docs.filter(d=> d.condicion==='credito' && !pagados.has(d.id) && !d.nc);
+  return S.docs.filter(d=> d.condicion==='credito' && !d.nc && pendienteDoc(d) > 1);
 }
 
 function emparejar(){
@@ -2537,7 +2807,7 @@ function emparejar(){
       if(usadosDoc.has(d.id)) return false;
       if(esAbono && d.clase!=='venta') return false;
       if(!esAbono && d.clase!=='compra') return false;
-      return Math.abs(d.total - Math.abs(m.monto)) <= 1;
+      return Math.abs(pendienteDoc(d) - Math.abs(m.monto)) <= 1;
     }).map(d=>{
       let punt = 0;
       const dd = diasEntre(d.fecha, m.fecha);
@@ -2640,7 +2910,8 @@ const COLS_LIB = {
   nombre: ['nombrecuenta','cuentanombre','nombredelacuenta','denominacion','descripcioncuenta','nombre','cuenta'],
   debe:   ['debe','debito','debitos','cargo','cargos','deudor'],
   haber:  ['haber','credito','creditos','abono','abonos','acreedor'],
-  monto:  ['monto','importe','valor','saldo']
+  monto:  ['monto','importe','valor','saldo'],
+  cc:     ['centrodecosto','centrodecostos','centrocosto','centrocostos','ccosto','cc']
 };
 
 // El orden importa: primero lo que se reconoce por cómo empieza el nombre,
@@ -3055,7 +3326,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
     const rc = resolverCuenta(cod, nom);
     lineas.push({fila:filaArchivo[i], fecha:ultFecha, num:ultNum, glosa:ultGlosa || 'Asiento importado',
                  cod: rc.cod, nom, nueva: rc.nueva, via: rc.via, codArchivo: cod,
-                 debe:R(debe), haber:R(haber)});
+                 debe:R(debe), haber:R(haber), cc:String(g(f,'cc')||'').trim()});
   });
 
   const modoDetectado = detectarModoLibro(filas.slice(0, ini+1).concat(cuerpo), mapa, ini);
@@ -3189,7 +3460,7 @@ function confirmarLibro(an, fechaSaldos){
   }
   let n = 0;
   an.asientos.forEach(gr=>{
-    const l = gr.lineas.map(x=>({c:x.cod, d:x.debe, h:x.haber}));
+    const l = gr.lineas.map(x=>({c:x.cod, d:x.debe, h:x.haber, cc:centroDesdeTexto(x.cc)}));
     const glosa = (gr.num ? 'N° '+gr.num+' ' : '') + gr.glosa;
     if(addAsiento(gr.fecha, glosa.slice(0,120), l, 'importado')) n++;
   });
@@ -3944,10 +4215,10 @@ function vencimientos(){
 // La regla que guía esto: el mejor reporte es el que se explica solo. Cada
 // número viene con su lectura en palabras, no solo con un color.
 function indicadores(){
-  const corte = ymActual(), lista = asientosHasta(corte), m = saldos(lista);
+  const C = corte(), lista = C.lista, m = saldos(lista);
   const sal = c => m[c] ? m[c].debe - m[c].haber : 0;
   const E = esf(lista), r = eri(lista);
-  const A = f29Ano(), idx = S.ui.mes;
+  const A = f29Ano(), idx = C.mesIdx;
   const meses = idx + 1;
 
   const caja = sal('1101') + sal('1102');
@@ -4165,6 +4436,26 @@ function graficoEstructura(E){
   g += col(izq, 110, 120, 'Lo que tiene · ' + $c(totI));
   g += col(der, 300, 120, 'Cómo lo financia · ' + $c(totD + negPat));
   return svgG(g, H, 'Estructura del balance');
+}
+
+// Barras horizontales, una por concepto, con el monto al final. Acepta negativos:
+// el cero queda donde corresponde y la barra crece hacia la izquierda.
+// items = [{n, v, c}]
+function graficoBarrasH(items, titulo){
+  items = items.filter(x=>x.v && isFinite(x.v));
+  if(!items.length) return '';
+  const fila = 24, y0 = 6, H = y0 + items.length*fila + 18, xl = 150, xr = G_W - 70;
+  const lo = Math.min(0, ...items.map(x=>x.v)), hi = Math.max(0, ...items.map(x=>x.v));
+  const sx = v => xl + (v - lo) / ((hi - lo) || 1) * (xr - xl);
+  let g = `<line x1="${sx(0).toFixed(1)}" x2="${sx(0).toFixed(1)}" y1="${y0}" y2="${H-14}" stroke="var(--ink3)" stroke-width="1"/>`;
+  items.forEach((x, i)=>{
+    const y = y0 + i*fila, a = sx(Math.min(0, x.v)), b = sx(Math.max(0, x.v));
+    const nom = String(x.n).length > 24 ? String(x.n).slice(0,23) + '…' : x.n;
+    g += `<text x="${xl - 8}" y="${y + 15}" font-size="11" fill="var(--ink)" text-anchor="end">${esc(nom)}</text>`
+       + `<rect x="${a.toFixed(1)}" y="${y + 4}" width="${Math.max(0.8, b - a).toFixed(1)}" height="${fila - 9}" rx="2" fill="${x.c || (x.v < 0 ? 'var(--bad)' : 'var(--ok)')}"><title>${esc(x.n)}: ${esc(fmt(x.v))}</title></rect>`
+       + `<text x="${(b + 4).toFixed(1)}" y="${y + 15}" font-size="10.5" fill="${x.v < 0 ? 'var(--bad)' : 'var(--ink2)'}">${esc($c(x.v))}</text>`;
+  });
+  return svgG(g, H, titulo);
 }
 
 // Saldo de la cuenta día a día según la cartola (saldo al cierre de cada día).
@@ -4481,6 +4772,183 @@ function slugEmpresa(t){
     .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
     .replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,45) || 'empresa';
 }
+/* ---- una sola fuente para ver, imprimir y exportar ----------------------
+   Antes cada salida armaba sus números por su cuenta: el balance en pantalla
+   podía estar al mes y el CSV del diario traía el año entero, y el informe
+   escondía las cuentas sin subgrupo aunque sí las sumaba en los totales.
+   Ahora todas parten del mismo corte y de las mismas filas, y cada archivo
+   lleva la misma cifra de control para comprobar que hablan de lo mismo. */
+function finDeMes(ym){ const [y,m] = ym.split('-').map(Number); return ym + '-' + String(new Date(y, m, 0).getDate()).padStart(2,'0'); }
+function corte(){
+  const todo = S.ui.balanceTodo === true, ej = S.emp.ejercicio;
+  const ym = todo ? ej + '-12' : ymActual();
+  const lista = todo ? asientosDelEjercicio() : asientosHasta(ym);
+  const hasta = finDeMes(ym);
+  let debe = 0, haber = 0;
+  lista.forEach(a=>a.lineas.forEach(l=>{ debe += num(l.d); haber += num(l.h); }));
+  const mesIdx = todo ? 11 : S.ui.mes;
+  return {todo, ym, hasta, lista, mesIdx, n:lista.length, debe:R(debe), haber:R(haber),
+          etiqueta: todo ? 'ejercicio ' + ej + ' completo'
+                         : 'acumulado al ' + (+hasta.slice(8)) + ' de ' + MESES[mesIdx] + ' de ' + ej};
+}
+function controlCorte(c){ return c.n + ' asiento(s) · suma del Debe $ ' + fmt(c.debe) + (c.debe!==c.haber ? ' · ¡Haber $ ' + fmt(c.haber) + '!' : ''); }
+
+// Filas del estado de situación y del de resultados. Los filtros son el espejo
+// exacto de clasificar(): toda cuenta que suma en un total aparece en su grupo.
+// forma (opcional, de formaEEFF): fija qué cuentas y grupos aparecen, aunque valgan cero en este período.
+function filasEEFF(lista, forma){
+  const m = saldos(lista), E = esf(lista), r = eri(lista);
+  const sal = c => m[c] ? m[c].debe - m[c].haber : 0;
+  const cods = forma ? [...forma.cods].sort() : Object.keys(m).sort();
+  const vale = x => forma || R(x.v)!==0;
+  const grupo = (filtro, inv) => cods.filter(c=>CTA[c] && filtro(CTA[c]))
+    .map(c=>({c, nom:nomCta(c), v:sal(c) * (inv?-1:1)})).filter(vale);
+  const hay = (k, v) => forma ? forma[k] : !!v;
+  const esAct = t => t.tipo==='activo' || t.tipo==='activoC';
+  const fuera = cods.filter(c=>!CTA[c] || !['activo','activoC','pasivo','patrimonio','patrimonioD','ingreso','gasto'].includes(CTA[c].tipo))
+    .map(c=>({c, nom:nomCta(c) + ' (fuera del plan)', v:sal(c)})).filter(vale);
+  const gastoOper = t => t.tipo==='gasto' && !['costo','financiero','impuesto'].includes(t.sub);
+  const esf_ = [
+    {sec:'Activo corriente'}, ...grupo(t=>esAct(t) && t.clase!=='nc'), ...fuera, {tot:'Total activo corriente', v:E.ac},
+    {sec:'Activo no corriente'}, ...grupo(t=>esAct(t) && t.clase==='nc'), {tot:'Total activo no corriente', v:E.anc},
+    {tot:'Total activo', v:E.activo},
+    {sec:'Pasivo corriente'}, ...grupo(t=>t.tipo==='pasivo' && t.clase!=='nc', true), {tot:'Total pasivo corriente', v:E.pc},
+    ...(hay('pnc', E.pnc) ? [{sec:'Pasivo no corriente'}, ...grupo(t=>t.tipo==='pasivo' && t.clase==='nc', true), {tot:'Total pasivo no corriente', v:E.pnc}] : []),
+    {sec:'Patrimonio'}, ...grupo(t=>t.tipo==='patrimonio', true), ...grupo(t=>t.tipo==='patrimonioD', true),
+    {nom:'Resultado del ejercicio', v:E.res}, {tot:'Total patrimonio', v:E.patrimonio},
+    {tot:'Total pasivo y patrimonio', v:E.total}
+  ];
+  const eri_ = [
+    {sec:'Ingresos de actividades ordinarias'}, ...grupo(t=>t.tipo==='ingreso' && t.sub!=='otros', true), {tot:'Total ingresos ordinarios', v:r.ingresos},
+    {sec:'Costo de ventas'}, ...grupo(t=>t.tipo==='gasto' && t.sub==='costo'), {tot:'Margen bruto', v:r.bruto},
+    {sec:'Gastos de administración y ventas'}, ...grupo(gastoOper),
+    ...(hay('otrosIng', r.otrosIng) ? [{sec:'Otros ingresos'}, ...grupo(t=>t.tipo==='ingreso' && t.sub==='otros', true)] : []),
+    {tot:'Resultado operacional', v:r.operacional},
+    ...(hay('fin', r.fin) ? grupo(t=>t.tipo==='gasto' && t.sub==='financiero') : [{nom:'Gastos financieros', v:0}]),
+    {tot:'Resultado antes de impuesto', v:r.antesImp},
+    ...(hay('imp', r.imp) ? grupo(t=>t.tipo==='gasto' && t.sub==='impuesto') : [{nom:'Impuesto a la renta', v:0}]),
+    {tot:'Resultado del ejercicio', v:r.neto}
+  ];
+  return {E, r, esf:esf_, eri:eri_};
+}
+function tablaFilas(filas){
+  return filas.map(f=> f.sec ? `<tr class="sec"><td colspan="2">${esc(f.sec)}</td></tr>`
+    : f.tot ? `<tr class="tot"><td>${esc(f.tot)}</td><td class="n">${$$(f.v)}</td></tr>`
+    : `<tr><td>${f.c?'<span class="cod">'+f.c+'</span> ':''}${esc(f.nom)}</td><td class="n">${$$(f.v)}</td></tr>`).join('');
+}
+// Ventas del F29 (documentos) contra ingresos de la contabilidad, al mismo corte.
+function controlVentas(c){
+  const ac = acumTrib(c.mesIdx), r = eri(c.lista);
+  const f29 = R(ac.ventasNetas + ac.exentas), cont = R(r.ingresos);
+  return {f29, cont, dif: cont - f29};
+}
+
+/* ---- archivos CSV: todos con el mismo encabezado ---- */
+function celdaCSV(v){
+  if(typeof v === 'number') return String(R(v));
+  const t = String(v==null?'':v);
+  return /[;"\n\r]/.test(t) ? '"' + t.replace(/"/g,'""') + '"' : t;
+}
+function armarCSV(titulo, c, cab, filas){
+  const enc = [['Empresa', S.emp.nombre||''], ['RUT', S.emp.rut||''], ['Informe', titulo],
+               ['Corte', c.etiqueta], ['Asientos incluidos', c.n], ['Cifra de control (suma del Debe)', c.debe],
+               ['Generado', new Date().toLocaleString('es-CL')], []];
+  return '﻿' + enc.concat([cab], filas).map(f=>f.map(celdaCSV).join(';')).join('\r\n');
+}
+function nombreArchivo(base, c){ return slugEmpresa(S.emp.nombre) + '-' + base + '-' + (c.todo ? S.emp.ejercicio : c.ym) + '.csv'; }
+const EXPORTES = {
+  diario: c => armarCSV('Libro diario', c, ['Comprobante','Tipo','Folio','Fecha','Código','Cuenta','Glosa','Debe','Haber','Origen'],
+    [].concat(...c.lista.map(a=>a.lineas.map(l=>[cbteCorto(a), TIPOS_CBTE[a.tipo]||'', a.folio||'', a.fecha, l.c, nomCta(l.c), a.glosa||'', num(l.d), num(l.h), a.origen||''])))
+      .concat([[], ['Totales','','','','','','', c.debe, c.haber, '']])),
+  mayor: c => {
+    const filas = [], porCta = {};
+    c.lista.forEach(a=>a.lineas.forEach(l=>{ (porCta[l.c] = porCta[l.c] || []).push({a, l}); }));
+    Object.keys(porCta).sort().forEach(cod=>{
+      let s = 0, td = 0, th = 0;
+      porCta[cod].forEach(({a, l})=>{ s += num(l.d) - num(l.h); td += num(l.d); th += num(l.h);
+        filas.push([cod, nomCta(cod), a.fecha, cbteCorto(a), a.glosa||'', num(l.d), num(l.h), s]); });
+      filas.push([cod, 'Total ' + nomCta(cod), '', '', '', td, th, s], []);
+    });
+    return armarCSV('Libro mayor', c, ['Código','Cuenta','Fecha','Comprobante','Glosa','Debe','Haber','Saldo (+ deudor, − acreedor)'], filas);
+  },
+  balance: c => {
+    const b = balance8(c.lista);
+    const filas = b.filas.map(f=>[f.c, f.nom, f.sd, f.sh, f.deu, f.acr, f.act, f.pas, f.per, f.gan]);
+    filas.push(['', 'Sumas', b.T.sd, b.T.sh, b.T.deu, b.T.acr, b.T.act, b.T.pas, b.T.per, b.T.gan]);
+    const u = b.util;
+    filas.push(['', u>=0?'Utilidad del ejercicio':'Pérdida del ejercicio', '', '', '', '', u<0?-u:'', u>=0?u:'', u>=0?u:'', u<0?-u:'']);
+    filas.push(['', 'Totales', '', '', '', '', b.T.act+(u<0?-u:0), b.T.pas+(u>=0?u:0), b.T.per+(u>=0?u:0), b.T.gan+(u<0?-u:0)]);
+    return armarCSV('Balance tributario de 8 columnas', c, ['Código','Cuenta','Debe','Haber','Deudor','Acreedor','Activo','Pasivo','Pérdida','Ganancia'], filas);
+  },
+  eeff: c => {
+    const F = filasEEFF(c.lista);
+    const conv = (titulo, L) => [[titulo]].concat(L.map(f=> f.sec ? ['', f.sec, ''] : f.tot ? ['', f.tot, f.v] : [f.c||'', f.nom, f.v]));
+    return armarCSV('Estados financieros', c, ['Código','Concepto','Monto'],
+      conv('ESTADO DE SITUACIÓN FINANCIERA', F.esf).concat([[]], conv('ESTADO DE RESULTADOS', F.eri)));
+  },
+  auxiliar: c => {
+    const filas = [];
+    [['cli','CLIENTES'],['pro','PROVEEDORES']].forEach(([lado, tit])=>{
+      const X = auxiliar(lado, c.hasta);
+      filas.push([tit]);
+      X.filas.forEach(g=> g.docs.forEach(x=> filas.push([fmtRut(g.rut), g.nombre, dteAbr(x.d.dte) + (x.d.nc?' (NC)':''), x.d.folio||'', x.d.fecha, x.dias, montoDoc(x.d)*(x.d.nc?-1:1), x.pagado, x.p])));
+      filas.push(['', 'Total auxiliar', '', '', '', '', '', '', X.T.total], ['', 'Saldo contable cuenta ' + X.cta, '', '', '', '', '', '', X.contable],
+                 ['', 'Diferencia', '', '', '', '', '', '', X.dif], []);
+    });
+    return armarCSV('Auxiliar de clientes y proveedores', c, ['RUT','Contraparte','Documento','Folio','Fecha','Días','Monto','Cobrado o pagado','Saldo'], filas);
+  },
+  comparativo: c => {
+    const m = S.ui.cmpModo === 'mes' ? 'mes' : 'anual', X = comparativo(periodosComparados(m));
+    const conv = (tit, L) => [[tit]].concat(L.filter(f=>!f.sec).map(f=>{ const v = variacion(f.vs[0]||0, f.vs[1]||0);
+      return [f.c||'', f.tot||f.nom, f.vs[0]||0, f.vs[1]||0, v.d, v.p==null ? '' : dec(v.p*100,1)+'%']; }));
+    return armarCSV('Estados comparativos', c, ['Código','Concepto', X.tits[0], X.tits[1], 'Variación', '%'],
+      conv('ESTADO DE RESULTADOS', X.eri).concat([[]], conv('ESTADO DE SITUACIÓN FINANCIERA', X.esf)));
+  },
+  mensual: c => {
+    const X = eriMensual(c);
+    return armarCSV('Estado de resultados mes a mes', c, ['Código','Concepto'].concat(X.meses.map(x=>nomMes(x.ym)), ['Total']),
+      X.filas.filter(f=>!f.sec).map(f=>[f.c||'', f.tot||f.nom].concat(f.vs, [f.total])));
+  },
+  flujo: c => {
+    const FC = flujoCaja(c), filas = [['', 'Saldo inicial'].concat(FC.ini, [FC.inicial])];
+    SECC_FLUJO.forEach(([k, nom])=>{
+      filas.push([nom]);
+      Object.keys(FC.secc[k].lineas).forEach(x=>{ const L = FC.secc[k].lineas[x]; filas.push(['', x].concat(L, [L.reduce((a,b)=>a+b,0)])); });
+      filas.push(['', 'Flujo de ' + nom.replace('Actividades de ', '')].concat(FC.secc[k].tot, [FC.total[k]]));
+    });
+    filas.push(['', 'Flujo neto'].concat(FC.neto, [FC.total.neto]), ['', 'Saldo final'].concat(FC.fin, [FC.fin[FC.n-1]]),
+               [], ['', 'Saldo de caja y banco en el mayor', FC.mayor]);
+    return armarCSV('Flujo de caja (método directo)', c, ['', 'Concepto'].concat(MESES.slice(0, FC.n), ['Total']), filas);
+  },
+  centros: c => {
+    const RC = resultadoPorCentro(c.lista), cols = RC.cols;
+    const filas = RC.ctas.map(k=>[k, nomCta(k)].concat(cols.map(x=>RC.M[k][x]||0), [cols.reduce((a,x)=>a+(RC.M[k][x]||0),0)]));
+    [['ing','Ingresos'],['costo','Costo de ventas'],['gasto','Gastos'],['res','Resultado']].forEach(([f,n])=>
+      filas.push(['', n].concat(cols.map(x=>RC.T[x][f]), [cols.reduce((a,x)=>a+RC.T[x][f],0)])));
+    return armarCSV('Resultado por centro de costo', c, ['Código','Cuenta'].concat(cols.map(nomCentro), ['Total']), filas);
+  }
+};
+const NOMBRES_EXP = {eeff:'estados-financieros', balance:'balance-8-columnas', comparativo:'estados-comparativos', mensual:'resultado-mes-a-mes', flujo:'flujo-de-caja', centros:'centros-de-costo', auxiliar:'auxiliar'};
+function exportar(k){
+  const c = corte();
+  bajar(nombreArchivo(NOMBRES_EXP[k] || 'libro-' + k, c), EXPORTES[k](c), 'text/csv');
+  toast('Exportado · ' + c.etiqueta);
+}
+function botonesExportar(){
+  const c = corte();
+  return `<div class="card noprint">
+    <h3>Exportar este corte</h3>
+    <p class="sub">Todo sale del mismo corte que ves arriba: ${esc(c.etiqueta)}. Cada archivo trae en su encabezado la cifra de control (${esc(controlCorte(c))}); si dos archivos la tienen igual, sus montos cuadran entre sí.</p>
+    <div class="row">
+      <button class="btn ghost sm" data-exp="balance">Balance 8 columnas</button>
+      <button class="btn ghost sm" data-exp="eeff">Estados financieros</button>
+      <button class="btn ghost sm" data-exp="diario">Libro diario</button>
+      <button class="btn ghost sm" data-exp="mayor">Libro mayor</button>
+      <button class="btn ghost sm" data-exp="auxiliar">Auxiliar por RUT</button>
+      <button class="btn ghost sm" onclick="window.print()">Imprimir</button>
+    </div></div>`;
+}
+
 function nombreInforme(){
   return slugEmpresa(S.emp.nombre) + '-' + S.emp.ejercicio + '-' + String(S.ui.mes+1).padStart(2,'0') + '.html';
 }
@@ -4490,21 +4958,12 @@ function urlInforme(){
 }
 
 function generarInforme(op){
-  const corte = ymActual();
-  const lista = asientosHasta(corte);
-  const E = esf(lista), r = eri(lista), IND = indicadores();
-  const A = f29Ano(), idx = S.ui.mes, f = A[idx], R0 = renta();
-  const acum = acumTrib(idx);
+  const C = corte(), lista = C.lista;
+  const F = filasEEFF(lista), E = F.E, IND = indicadores();
+  const A = f29Ano(), idx = C.mesIdx, f = A[idx], R0 = renta();
+  const acum = acumTrib(idx), cv = controlVentas(C);
   const hoy = hoyISO();
   const fila = (n,v,cls) => `<tr><td>${esc(n)}</td><td class="n ${cls||''}">${$$(v)}</td></tr>`;
-  const grupo = (filtro, invertir) => {
-    const m = saldos(lista);
-    return Object.keys(m).sort().filter(c=>{ const t=CTA[c]; return t && filtro(t); }).map(c=>{
-      const v = (m[c].debe - m[c].haber) * (invertir?-1:1);
-      if(R(v)===0) return '';
-      return `<tr><td><span class="cod">${c}</span> ${esc(nomCta(c))}</td><td class="n">${$$(v)}</td></tr>`;
-    }).join('');
-  };
 
   const barras = graficoPanel(IND, idx) ? graficoPanel(IND, idx) + '<div style="font-size:12px;color:var(--ink3);margin:2px 0 10px">' + esc(lecturaPanel(IND, idx)) + '</div>' : '';
 
@@ -4543,7 +5002,7 @@ tr.sec td{background:#F0F2EE;font-weight:600;font-size:12px;color:var(--ink2)}
 </style></head><body>
 <header><div class="wrap">
   <div class="t">${esc(S.emp.nombre || 'Informe financiero')}</div>
-  <div class="s">${esc(S.emp.rut ? 'RUT ' + S.emp.rut + ' · ' : '')}${esc(REG_CORTO[S.emp.regimen])} · acumulado del ejercicio ${S.emp.ejercicio} hasta ${MESES[idx]}</div>
+  <div class="s">${esc(S.emp.rut ? 'RUT ' + S.emp.rut + ' · ' : '')}${esc(REG_CORTO[S.emp.regimen])} · ${esc(C.etiqueta)}</div>
 </div></header>
 <div class="wrap">
 
@@ -4558,42 +5017,22 @@ ${(()=>{ const gr = graficoEstructura(E); return gr ? `<div class="card"><div st
 <div class="dos">
 <div>
 <h2>Estado de situación financiera</h2>
-<div class="card"><table><tbody>
-  <tr class="sec"><td colspan="2">Activo corriente</td></tr>
-  ${grupo(t=>(t.tipo==='activo'||t.tipo==='activoC') && t.clase==='c')}
-  <tr class="tot"><td>Total activo corriente</td><td class="n">${$$(E.ac)}</td></tr>
-  <tr class="sec"><td colspan="2">Activo no corriente</td></tr>
-  ${grupo(t=>(t.tipo==='activo'||t.tipo==='activoC') && t.clase==='nc')}
-  <tr class="tot"><td>Total activo</td><td class="n">${$$(E.activo)}</td></tr>
-  <tr class="sec"><td colspan="2">Pasivo</td></tr>
-  ${grupo(t=>t.tipo==='pasivo', true)}
-  <tr class="tot"><td>Total pasivo</td><td class="n">${$$(E.pasivo)}</td></tr>
-  <tr class="sec"><td colspan="2">Patrimonio</td></tr>
-  ${grupo(t=>t.tipo==='patrimonio', true)}${grupo(t=>t.tipo==='patrimonioD', true)}
-  ${fila('Resultado del ejercicio', E.res)}
-  <tr class="tot"><td>Total pasivo y patrimonio</td><td class="n">${$$(E.total)}</td></tr>
-</tbody></table></div>
+<div class="card"><table><tbody>${tablaFilas(F.esf)}</tbody></table></div>
 </div>
 
 <div>
 <h2>Estado de resultados</h2>
-<div class="card"><table><tbody>
-  <tr class="sec"><td colspan="2">Ingresos de actividades ordinarias</td></tr>
-  ${grupo(t=>t.tipo==='ingreso' && t.sub!=='otros', true)}
-  <tr class="sec"><td colspan="2">Costo de ventas</td></tr>
-  ${grupo(t=>t.tipo==='gasto' && t.sub==='costo')}
-  <tr class="tot"><td>Margen bruto</td><td class="n">${$$(r.bruto)}</td></tr>
-  <tr class="sec"><td colspan="2">Gastos de administración y ventas</td></tr>
-  ${grupo(t=>t.tipo==='gasto' && (t.sub==='operacional'||!t.sub))}
-  ${r.otrosIng?`<tr class="sec"><td colspan="2">Otros ingresos</td></tr>${grupo(t=>t.tipo==='ingreso'&&t.sub==='otros',true)}`:''}
-  <tr class="tot"><td>Resultado operacional</td><td class="n">${$$(r.operacional)}</td></tr>
-  ${r.fin?grupo(t=>t.tipo==='gasto'&&t.sub==='financiero'):''}
-  <tr class="tot"><td>Resultado antes de impuesto</td><td class="n">${$$(r.antesImp)}</td></tr>
-  ${r.imp?grupo(t=>t.tipo==='gasto'&&t.sub==='impuesto'):''}
-  <tr class="tot"><td>Resultado del ejercicio</td><td class="n">${$$(r.neto)}</td></tr>
-</tbody></table></div>
+<div class="card"><table><tbody>${tablaFilas(F.eri)}</tbody></table></div>
 </div>
 </div>
+
+${(()=>{ const FC = flujoCaja(C); if(!FC.total.op && !FC.total.inv && !FC.total.fin) return '';
+  const gr = graficoMeses({cats: MESES.slice(0, FC.n).map(m=>m.slice(0,3)), destacar: idx, titulo:'Caja mes a mes',
+    series:[{n:'Flujo neto del mes', v:FC.neto, c:'var(--debe)'}], linea:{n:'Saldo de caja', v:FC.fin, c:'var(--ok)'}});
+  return `<h2>Flujo de caja</h2><div class="card">${gr}<table><tbody>
+  ${fila('Caja al inicio', FC.inicial)}${fila('Generado por la operación', FC.total.op)}${fila('Invertido en activo fijo', FC.total.inv)}
+  ${fila('Aportes y préstamos, menos retiros', FC.total.fin)}<tr class="tot"><td>Caja al corte</td><td class="n">${$$(FC.fin[FC.n-1])}</td></tr>
+  </tbody></table></div>`; })()}
 
 ${op.tributario===false ? '' : `
 <h2>Situación tributaria</h2>
@@ -4611,17 +5050,19 @@ ${op.tributario===false ? '' : `
   ${fila('Menos: PPM del ejercicio', -R0.ppm)}
   <tr class="tot"><td>${R0.saldo>=0?'Saldo estimado a pagar':'Devolución estimada'}</td><td class="n">${$$(Math.abs(R0.saldo))}</td></tr>
 </tbody></table>
-<div style="font-size:12px;color:var(--ink3);margin-top:8px">Es una proyección con la información registrada al corte. La declaración definitiva se determina en el Formulario 22.</div></div>`}
+<div style="font-size:12px;color:var(--ink3);margin-top:8px">Es una proyección con la información registrada al corte. La declaración definitiva se determina en el Formulario 22.</div>
+${Math.abs(cv.dif) > 2 ? `<div style="font-size:12px;color:var(--warn);margin-top:8px">Las ventas netas del año salen de los documentos tributarios (${$$(cv.f29)}) y los ingresos del estado de resultados salen de la contabilidad (${$$(cv.cont)}). La diferencia de ${$$(Math.abs(cv.dif))} corresponde a ingresos registrados por asiento sin documento, o a documentos cuyo asiento se borró.</div>` : ''}</div>`}
 
 ${op.documentos ? `
 <h2>Documentos del período</h2>
 <div class="card"><table><tbody>
   <tr class="sec"><td>Documento</td><td class="n">Total</td></tr>
-  ${docsMes(corte).slice(0,60).map(d=>`<tr><td>${esc(dteAbr(d.dte))} N° ${esc(d.folio||'')} · ${esc(d.contraparte||'')}${d.nc?' (nota de crédito)':''}<div class="cod">${esc(d.fecha)}</div></td><td class="n">${$$(d.total)}</td></tr>`).join('')}
+  ${docsMes(C.ym).slice(0,60).map(d=>`<tr><td>${esc(dteAbr(d.dte))} N° ${esc(d.folio||'')} · ${esc(d.contraparte||'')}${d.nc?' (nota de crédito)':''}<div class="cod">${esc(d.fecha)}</div></td><td class="n">${$$(d.total)}</td></tr>`).join('')}
 </tbody></table></div>` : ''}
 
 <div class="pie">
-  Informe generado el ${hoy} con Cuadratura, a partir de la contabilidad registrada hasta el ${MESES[idx]} de ${S.emp.ejercicio}.
+  Informe generado el ${hoy} con Cuadratura, a partir de la contabilidad registrada: ${esc(C.etiqueta)}.
+  Cifra de control: ${esc(controlCorte(C))}; es la misma que traen los archivos exportados de este corte.
   Es un documento de solo lectura: refleja la situación a esa fecha y no se actualiza solo.
   Los estados se presentan bajo NIIF para las PYMES y no constituyen estados financieros auditados.
   ${op.nota ? '<br><br>' + esc(op.nota) : ''}
@@ -4631,8 +5072,8 @@ ${op.documentos ? `
 
 /* ====================== 11. vistas ==================================== */
 const VISTAS = [
-  ['panel','Panel'],['docs','Documentos'],['banco','Banco'],['remun','Remuneraciones'],['diario','Diario'],['mayor','Mayor'],
-  ['balance','Balance'],['f29','F29'],['plan','Planificación'],['cierre','Cierre'],['revisor','Revisor'],['compartir','Compartir'],['cuadre','Cuadratura'],['config','Ajustes']
+  ['panel','Panel'],['docs','Documentos'],['banco','Banco'],['remun','Remuneraciones'],['diario','Diario'],['mayor','Mayor'],['aux','Auxiliares'],
+  ['balance','Balance'],['analisis','Análisis'],['f29','F29'],['plan','Planificación'],['cierre','Cierre'],['revisor','Revisor'],['compartir','Compartir'],['cuadre','Cuadratura'],['config','Ajustes']
 ];
 
 function vPanel(){
@@ -4727,6 +5168,8 @@ function vPanel(){
       </div>`).join('')}</div>
   </div>
 
+  ${tarjetaGraficosPanel()}
+
   <div class="card">
     <h3>Lo que viene</h3>
     <ul class="lista">${ven.map(v=>`
@@ -4738,12 +5181,39 @@ function vPanel(){
   </div>`;
 }
 
+// Tres gráficos que responden lo que el dueño pregunta primero: cuánta caja
+// hay, quién debe y en qué se va la plata.
+function tarjetaGraficosPanel(){
+  const C = corte(), FC = flujoCaja(C), X = auxiliar('cli', C.hasta);
+  const gCaja = graficoMeses({cats: MESES.slice(0, FC.n).map(m=>m.slice(0,3)), destacar: C.mesIdx, titulo:'Caja mes a mes',
+    series:[{n:'Flujo neto del mes', v:FC.neto, c:'var(--debe)'}], linea:{n:'Saldo de caja', v:FC.fin, c:'var(--ok)'}});
+  const colTr = ['var(--ok)', '#8DAA6B', 'var(--warn)', '#C0703C', 'var(--bad)'];
+  const gAnt = graficoBarrasH(TRAMOS_AUX.map((t, i)=>({n: t[1], v: X.T.tramos[i], c: colTr[i]})), 'Antigüedad de lo que deben los clientes');
+  const m = saldos(C.lista);
+  const gastos = Object.keys(m).filter(c=>CTA[c] && CTA[c].tipo==='gasto').map(c=>({n: nomCta(c), v: m[c].debe - m[c].haber, c:'var(--haber)'}))
+    .filter(x=>x.v > 0).sort((a,b)=>b.v - a.v);
+  const totG = gastos.reduce((a,x)=>a + x.v, 0);
+  const top = gastos.slice(0, 6);
+  if(gastos.length > 6) top.push({n:'Otros ' + (gastos.length - 6), v: gastos.slice(6).reduce((a,x)=>a + x.v, 0), c:'var(--ink3)'});
+  const gGas = graficoBarrasH(top, 'En qué se va la plata');
+  if(!gCaja && !gAnt && !gGas) return '';
+  const vencido = X.T.tramos.slice(1).reduce((a,b)=>a+b, 0);
+  return `<div class="card" style="grid-column:1/-1">
+    <h3>Caja, cobranza y gastos</h3>
+    <div class="split2">
+      ${gCaja ? `<div>${gCaja}<div class="tiny">${FC.total.op >= 0 ? 'La operación generó ' + $$(FC.total.op) : 'La operación consumió ' + $$(-FC.total.op)} en el período. Detalle en Análisis › Flujo de caja.</div></div>` : ''}
+      ${gAnt ? `<div>${gAnt}<div class="tiny">${X.T.total ? (vencido ? Math.round(vencido / X.T.total * 100) + '% de lo que deben los clientes tiene más de 30 días.' : 'Todo lo que deben los clientes tiene menos de 30 días.') : ''} Detalle por cliente en Auxiliares.</div></div>` : ''}
+      ${gGas ? `<div>${gGas}<div class="tiny">${top.length ? esc(top[0].n) + ' es el gasto más grande: ' + Math.round(top[0].v / totG * 100) + '% del total.' : ''}</div></div>` : ''}
+    </div></div>`;
+}
+
 /* ---- documentos ---- */
 function vDocs(){
   const ym = ymActual();
   const fil = S.ui.filtroDoc;
   const L = docsMes(ym).filter(d=> fil==='todos' || d.clase===fil);
   return `
+  ${avisoCerrado()}
   <div class="card noprint" id="formDoc"></div>
   <div class="chips">
     ${['todos','venta','compra','honorario'].map(k=>`<button class="chip" aria-pressed="${fil===k}" data-fil="${k}">${k==='todos'?'Todos':k==='venta'?'Ventas':k==='compra'?'Compras':'Honorarios'}</button>`).join('')}
@@ -4757,7 +5227,8 @@ function vDocs(){
       <td class="n op">${fmt(d.neto)}</td><td class="n op">${d.exento?fmt(d.exento):'<span class="z">—</span>'}</td>
       <td class="n op">${d.iva?fmt(d.iva):'<span class="z">—</span>'}</td>
       <td class="n op">${d.ila?fmt(d.ila):(d.retencion?'<span class="tiny">ret </span>'+fmt(d.retencion):'<span class="z">—</span>')}</td>
-      <td class="n">${fmt(d.total)}<div class="noprint" style="margin-top:3px"><button class="btn sm danger" data-delDoc="${d.id}" title="Borrar documento y asiento" style="padding:1px 7px;font-size:12px">✕</button></div></td></tr>`).join('')
+      <td class="n">${fmt(d.total)}${d.condicion==='credito' && !d.nc ? (()=>{ const p = R(pendienteDoc(d)); return `<div class="tiny">${p<=1?'pagado':p<montoDoc(d)?'saldo '+fmt(p):'pendiente'}</div>`; })() : ''}
+        <div class="noprint" style="margin-top:3px">${periodoCerrado(d.fecha) ? '' : `<button class="btn sm danger" data-delDoc="${d.id}" title="Borrar documento y asiento" style="padding:1px 7px;font-size:12px">✕</button>`}</div></td></tr>`).join('')
       : '<tr><td colspan="8" class="sub" style="padding:18px;text-align:center">No hay documentos en este mes. Registra el primero arriba.</td></tr>'}
     </tbody>
   </table></div>
@@ -4804,6 +5275,7 @@ function formDoc(clase){
       <option value="credito">${clase==='venta'?'A crédito (Clientes)':'A crédito (Proveedores)'}</option>
       <option value="banco">Al contado, banco</option><option value="caja">Al contado, caja</option></select></div>
   </div>
+  ${(S.centros||[]).length ? `<div style="margin-top:8px"><label>Centro de costo</label>${selCentro('f_cc', S.ui.ultCentro||'')}</div>` : ''}
   ${clase==='compra'?`<div style="margin-top:8px"><label><input type="checkbox" id="f_cred" checked style="width:auto;margin-right:6px">Da derecho a crédito fiscal</label>
     <div class="tiny">Desmárcalo en automóviles, gastos sin factura a nombre de la empresa y demás casos del Art. 23. Ahí el IVA se suma al costo o al gasto.</div></div>`:''}
   ${clase==='venta'&&S.emp.inventarioPermanente?`<div style="margin-top:8px"><label>Costo de la mercadería vendida</label><input type="text" inputmode="numeric" class="mny" id="f_costo" inputmode="numeric" placeholder="0">
@@ -5731,14 +6203,49 @@ const PLANTILLAS = {
   renta:{n:'Provisión del impuesto a la renta', g:'Provisión impuesto a la renta ejercicio {ano}', l:[['5112','d'],['2110','h']]}
 };
 
-function vDiario(){
+function avisoCerrado(){
   const ym = ymActual();
-  const L = asientosDelEjercicio().filter(a=>ymOf(a.fecha)===ym);
-  const d = cuadraDiario();
+  if(!periodoCerrado(ym+'-01')) return '';
+  const c = S.cierres[ym];
+  return `<div class="note noprint">${MESES[S.ui.mes]} ${S.ui.ano} está cerrado desde el ${esc((c.cuando||'').slice(0,10))}: sus documentos y comprobantes quedan fijos. Para cambiarlos, reábrelo en Cierre › Períodos.</div>`;
+}
+// Comprobante contable imprimible, con las firmas de quien lo prepara, revisa y aprueba.
+function htmlComprobante(a){
+  const d = a.lineas.reduce((t,l)=>t+num(l.d),0), h = a.lineas.reduce((t,l)=>t+num(l.h),0);
+  const doc = a.doc ? S.docs.find(x=>x.id===a.doc) : null;
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${esc(etiquetaCbte(a))} · ${esc(S.emp.nombre||'')}</title>
+  <style>body{font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;color:#16211C;margin:14mm;font-size:12.5px;font-variant-numeric:tabular-nums}
+  h1{font-size:17px;margin:0}.s{color:#55625B;margin:2px 0 12px}table{border-collapse:collapse;width:100%}
+  th,td{border-bottom:1px solid #CBD1C8;padding:6px 7px;text-align:left}th{font-size:11px;color:#55625B}
+  .n{text-align:right;white-space:nowrap}tfoot td{font-weight:600;border-top:2px solid #16211C}
+  .f{display:grid;grid-template-columns:repeat(3,1fr);gap:18mm;margin-top:24mm}.f div{border-top:1px solid #16211C;padding-top:4px;text-align:center;color:#55625B}
+  .k{display:grid;grid-template-columns:repeat(4,auto);gap:4px 18px;justify-content:start;margin-bottom:12px}.k b{font-weight:600}</style></head><body>
+  <h1>Comprobante de ${esc(TIPOS_CBTE[a.tipo]||'asiento')} N° ${esc(a.folio||a.n)}</h1>
+  <div class="s">${esc(S.emp.nombre||'')}${S.emp.rut?' · RUT '+esc(S.emp.rut):''}</div>
+  <div class="k"><span>Fecha</span><b>${esc(a.fecha)}</b><span>Origen</span><b>${esc(a.origen||'manual')}</b>
+    ${doc?`<span>Documento</span><b>${esc(dteAbr(doc.dte))} N° ${esc(doc.folio||'')}</b><span>Contraparte</span><b>${esc(doc.contraparte||'')}${doc.rut?' · '+esc(fmtRut(doc.rut)):''}</b>`:''}</div>
+  <div style="margin-bottom:10px"><b>Glosa:</b> ${esc(a.glosa||'')}</div>
+  <table><thead><tr><th>Código</th><th>Cuenta</th><th class="n">Debe</th><th class="n">Haber</th></tr></thead>
+  <tbody>${a.lineas.map(l=>`<tr><td>${esc(l.c)}</td><td>${esc(nomCta(l.c))}</td><td class="n">${l.d?fmt(l.d):''}</td><td class="n">${l.h?fmt(l.h):''}</td></tr>`).join('')}</tbody>
+  <tfoot><tr><td></td><td>Totales</td><td class="n">${fmt(d)}</td><td class="n">${fmt(h)}</td></tr></tfoot></table>
+  <div class="f"><div>Preparado por</div><div>Revisado por</div><div>Aprobado por</div></div>
+  <script>window.onload=()=>setTimeout(()=>window.print(),300)<\/script></body></html>`;
+}
+
+function vDiario(){
+  const ym = ymActual(), ft = S.ui.filtroCbte || 'todos';
+  const delMes = asientosDelEjercicio().filter(a=>ymOf(a.fecha)===ym);
+  const L = delMes.filter(a=> ft==='todos' || a.tipo===ft);
+  const d = cuadraDiario(), cerrado = periodoCerrado(ym+'-01');
+  const anulados = (S.bitacora||[]).filter(x=>x.accion==='anulado' && ymOf(x.fecha)===ym);
+  const cuenta = k => delMes.filter(a=>a.tipo===k).length;
   return `
+  ${avisoCerrado()}
   <div class="split">
   <div class="card noprint sticky-col">
-    ${S.ui.diarioModo==='importar' ? formLibro() : `
+    ${cerrado ? `<h3>${MESES[S.ui.mes]} está cerrado</h3><p class="sub">No se pueden grabar ni borrar comprobantes con fecha de este mes. Puedes grabar en un mes abierto cambiando la fecha, o reabrir el período.</p>
+      <div class="row"><button class="btn ghost" data-ir="cierre" data-cim="pe">Ir a Cierre › Períodos</button></div>` :
+    S.ui.diarioModo==='importar' ? formLibro() : `
     <div class="chips" style="margin-bottom:10px">
       <button class="chip" aria-pressed="true" data-dm="manual">Asiento manual</button>
       <button class="chip" aria-pressed="false" data-dm="importar">Importar desde Excel</button>
@@ -5753,27 +6260,39 @@ function vDiario(){
       </select></div>
       <div><label>Fecha</label><input type="date" id="a_fecha" value="${S.ui.ano}-${String(S.ui.mes+1).padStart(2,'0')}-${String(Math.min(new Date().getDate(),28)).padStart(2,'0')}"></div>
     </div>
-    <div style="margin-top:8px"><label>Glosa</label><input id="a_glosa" placeholder="Operación, documento, contraparte y período"></div>
+    <div class="grid2" style="margin-top:8px">
+      <div style="grid-column:span 1"><label>Glosa</label><input id="a_glosa" placeholder="Operación, documento, contraparte y período"></div>
+      <div><label>Tipo de comprobante</label><select id="a_tipo">
+        <option value="">Automático según caja y banco</option>
+        ${Object.keys(TIPOS_CBTE).map(k=>`<option value="${k}">${TIPOS_CBTE[k]}</option>`).join('')}</select></div>
+    </div>
     <div id="a_lineas" style="margin-top:10px"></div>
     <div class="row"><button class="btn ghost sm" id="a_add">Agregar línea</button>
       <button class="btn ghost sm" data-ir="config" title="Crear una cuenta nueva">+ cuenta</button>
       <div id="a_sum" class="tiny" style="margin-left:auto"></div></div>
     <div class="row" style="margin-top:8px"><button class="btn" id="a_save">Grabar asiento</button></div>
     <div class="hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> graba · <kbd>Enter</kbd> en un monto agrega otra línea</div>`}
-    ${S.ui.diarioModo==='importar' ? `<div class="row" style="margin-top:10px"><button class="btn ghost sm" data-dm="manual">Volver al asiento manual</button></div>` : ''}
+    ${S.ui.diarioModo==='importar' && !cerrado ? `<div class="row" style="margin-top:10px"><button class="btn ghost sm" data-dm="manual">Volver al asiento manual</button></div>` : ''}
   </div>
   <div>
+  <div class="chips noprint">
+    ${['todos','I','E','T'].map(k=>`<button class="chip" aria-pressed="${ft===k}" data-fcb="${k}">${k==='todos'?'Todos · '+delMes.length:TIPOS_CBTE[k]+'s · '+cuenta(k)}</button>`).join('')}
+  </div>
 
   ${L.length ? L.map(a=>`
     <div class="as">
-      <div class="as-h"><b>N° ${a.n}</b><span>${a.fecha.slice(8)}-${a.fecha.slice(5,7)}</span>
-        ${a.origen==='doc'?'<span class="flag f-mute">documento</span>':a.origen==='f29'?'<span class="flag f-mute">F29</span>':''}
-        <span class="x noprint"><button class="btn sm danger" data-delA="${a.id}" style="padding:1px 7px;font-size:12px">✕</button></span></div>
+      <div class="as-h"><b>${esc(etiquetaCbte(a))}</b><span>${a.fecha.slice(8)}-${a.fecha.slice(5,7)}</span>
+        ${a.origen==='doc'?'<span class="flag f-mute">documento</span>':a.origen==='f29'?'<span class="flag f-mute">F29</span>':a.origen==='banco'?'<span class="flag f-mute">banco</span>':a.origen==='aux'?'<span class="flag f-mute">auxiliar</span>':''}
+        <span class="x noprint"><button class="btn sm ghost" data-cbte="${a.id}" title="Imprimir comprobante con firmas" style="padding:1px 7px;font-size:12px">⎙</button>
+        ${periodoCerrado(a.fecha) ? '<span class="flag f-mute" title="Mes cerrado">cerrado</span>' : `<button class="btn sm danger" data-delA="${a.id}" style="padding:1px 7px;font-size:12px">✕</button>`}</span></div>
       <div class="as-g">${esc(a.glosa)}</div>
       ${a.lineas.map(l=>`<div class="as-l"><span><span class="cod">${l.c}</span> ${esc(nomCta(l.c))}</span>
         <em class="${l.d?'d':'h'}">${fmt(l.d||l.h)} <span class="s">${l.d?'debe':'haber'}</span></em></div>`).join('')}
     </div>`).join('')
-    : '<div class="card"><p class="sub" style="margin:0">Sin asientos en '+MESES[S.ui.mes]+'. Los documentos que registres generan los suyos solos; aquí se agregan los que no pasan por el F29.</p></div>'}
+    : '<div class="card"><p class="sub" style="margin:0">'+(delMes.length ? 'No hay comprobantes de ese tipo en '+MESES[S.ui.mes]+'.' : 'Sin asientos en '+MESES[S.ui.mes]+'. Los documentos que registres generan los suyos solos; aquí se agregan los que no pasan por el F29.')+'</p></div>'}
+  ${anulados.length ? `<details class="card"><summary>${anulados.length} comprobante(s) anulado(s) en ${MESES[S.ui.mes]}</summary>
+    <div class="tiny" style="margin-top:6px">Sus folios no se reutilizan. Así se explica cada salto en la numeración.</div>
+    ${anulados.map(x=>`<div class="as-l"><span>${esc(x.detalle)}</span><em class="tiny">${esc(x.cuando.slice(0,16).replace('T',' '))}</em></div>`).join('')}</details>` : ''}
   <div class="card">
     <div class="as-l" style="border:0;padding:0"><span class="sub">Ejercicio ${S.emp.ejercicio} · ${asientosDelEjercicio().length} asiento(s)</span></div>
     <div class="as-l"><span>Suma del Debe</span><em class="d">${fmt(d.debe)}</em></div>
@@ -5785,11 +6304,12 @@ function vDiario(){
   </div>`;
 }
 
-function lineaHTML(i, c, d, h){
+function lineaHTML(i, c, d, h, cc){
   return `<div class="row" style="margin-bottom:6px" data-lin="${i}">
     <div style="flex:2.4;min-width:150px"><select class="l_c">${PLAN_ACT.map(p=>`<option value="${p[0]}"${p[0]===c?' selected':''}>${p[0]} · ${esc(p[1])}</option>`).join('')}</select></div>
     <div style="flex:1;min-width:78px"><input type="text" inputmode="numeric" class="mny l_d" id="l_d_${i}" placeholder="Debe" value="${d?fmt(numCSV(d)):''}"></div>
     <div style="flex:1;min-width:78px"><input type="text" inputmode="numeric" class="mny l_h" id="l_h_${i}" placeholder="Haber" value="${h?fmt(numCSV(h)):''}"></div>
+    ${(S.centros||[]).length && esResultado(c) ? `<div style="flex:1.2;min-width:110px">${selCentro('', cc, 'l_cc')}</div>` : ''}
   </div>`;
 }
 
@@ -5812,7 +6332,7 @@ function vMayor(){
   <div>
   ${filas.length ? filas.map(f=>`
     <div class="as">
-      <div class="as-h"><b>${f.a.fecha.slice(8)}-${f.a.fecha.slice(5,7)}</b><span>asiento N° ${f.a.n}</span></div>
+      <div class="as-h"><b>${f.a.fecha.slice(8)}-${f.a.fecha.slice(5,7)}</b><span>${esc(etiquetaCbte(f.a))}</span></div>
       <div class="as-l"><span>${esc(f.a.glosa)}</span>
         <em class="${f.l.d?'d':'h'}">${fmt(f.l.d||f.l.h)} <span class="s">${f.l.d?'debe':'haber'}</span></em></div>
       <div class="as-l"><span class="tiny">saldo acumulado</span><em>${fmt(Math.abs(f.s))} <span class="s">${f.s<0?'acreedor':'deudor'}</span></em></div>
@@ -5826,6 +6346,213 @@ function vMayor(){
   </div>`;
 }
 
+/* ---- análisis: comparativos, resultado mes a mes, flujo de caja y centros ---- */
+function pctVar(p){ return p==null ? '—' : (p>=0 ? '+' : '') + dec(p*100, 1) + '%'; }
+const CHIPS_AN = [['cmp','Comparativo'],['mensual','Resultado mes a mes'],['flujo','Flujo de caja'],['cc','Centros de costo']];
+function vAnalisis(){
+  const modo = S.ui.anModo || 'cmp', C = corte();
+  return `<div class="chips noprint">
+    ${CHIPS_AN.map(([k,n])=>`<button class="chip" aria-pressed="${modo===k}" data-an="${k}">${n}</button>`).join('')}
+    <span class="tiny" style="align-self:center;margin-left:6px">Corte: ${esc(C.etiqueta)} · se cambia en Balance</span></div>`
+    + (modo==='mensual' ? anMensual(C) : modo==='flujo' ? anFlujo(C) : modo==='cc' ? anCentros(C) : anComparativo(C));
+}
+// Fila de una tabla de estados con varias columnas de montos.
+function filaMulti(f, vs, extra, ncols){
+  const celdas = vs.map(v=>`<td class="n">${f.sec ? '' : v ? fmt(v) : '<span class="z">—</span>'}</td>`).join('') + (extra||'');
+  if(f.sec) return `<tr class="sec"><td colspan="${ncols || vs.length + 1}">${esc(f.sec)}</td></tr>`;
+  return `<tr${f.tot ? ' class="tot"' : ''}><td>${f.c ? '<span class="cod">' + f.c + '</span> ' : ''}${esc(f.tot || f.nom)}</td>${celdas}</tr>`;
+}
+function tablaComparada(filas, tits){
+  return `<div class="tw"><table>
+    <thead><tr><th>Concepto</th>${tits.map(t=>`<th class="n">${esc(t)}</th>`).join('')}<th class="n">Variación</th><th class="n">%</th></tr></thead>
+    <tbody>${filas.map(f=>{
+      const v = variacion(f.vs[0] || 0, f.vs[1] || 0);
+      return filaMulti(f, f.vs, f.sec ? '' : `<td class="n">${R(v.d) ? fmt(v.d) : '<span class="z">—</span>'}</td><td class="n tiny">${R(v.d) ? pctVar(v.p) : ''}</td>`, tits.length + 3);
+    }).join('')}</tbody></table></div>`;
+}
+function resumenERI(l){ const r = eri(l); return {ing: r.ingresos + r.otrosIng, costo: r.costo, gasto: r.oper + r.fin + r.imp, neto: r.neto}; }
+
+function anComparativo(C){
+  const m = S.ui.cmpModo === 'mes' ? 'mes' : 'anual';
+  const P = periodosComparados(m), X = comparativo(P);
+  const a = resumenERI(P[0].eri), b = resumenERI(P[1].eri);
+  const gr = graficoMeses({cats:['Ingresos','Costo de ventas','Gastos','Resultado'], titulo:'Comparación de resultados',
+    series:[{n:X.tits[0], v:[a.ing, a.costo, a.gasto, a.neto], c:'var(--ok)'}, {n:X.tits[1], v:[b.ing, b.costo, b.gasto, b.neto], c:'#9FB0A6'}]});
+  const vi = variacion(a.ing, b.ing), vn = variacion(a.neto, b.neto);
+  const lectura = !X.vacios[1] && (b.ing || b.neto)
+    ? 'Los ingresos ' + (vi.d >= 0 ? 'subieron ' : 'bajaron ') + $$(Math.abs(vi.d)) + (vi.p != null ? ' (' + pctVar(vi.p) + ')' : '')
+      + ' y el resultado ' + (vn.d >= 0 ? 'mejoró ' : 'empeoró ') + $$(Math.abs(vn.d)) + ' frente a ' + X.tits[1] + '.'
+      + (a.ing && b.ing ? ' El margen neto pasó de ' + pct1(b.neto/b.ing) + ' a ' + pct1(a.neto/a.ing) + '.' : '')
+    : '';
+  return `
+  <div class="chips noprint" style="margin-top:4px">
+    <button class="chip" aria-pressed="${m==='anual'}" data-cmp="anual">Acumulado contra el año anterior</button>
+    <button class="chip" aria-pressed="${m==='mes'}" data-cmp="mes">Mes contra mes anterior</button>
+  </div>
+  <h2>Estados comparativos · ${esc(X.tits[0])} contra ${esc(X.tits[1])}</h2>
+  ${X.vacios[1] ? `<div class="note">No hay asientos de ${esc(X.tits[1])} cargados, así que esa columna va vacía. ${m==='anual' ? 'Para comparar contra el año anterior, importa su libro diario en Diario › Importar desde Excel: la app lo separa por año sola.' : ''}</div>` : ''}
+  ${gr ? `<div class="card">${gr}${lectura ? `<div class="tiny">${esc(lectura)}</div>` : ''}</div>` : ''}
+  <div class="split2">
+    <div class="card"><h3>Estado de resultados</h3>${tablaComparada(X.eri, X.tits)}</div>
+    <div class="card"><h3>Estado de situación financiera</h3>
+      <div class="tiny" style="margin-bottom:6px">${m==='anual' ? 'Al corte contra el cierre del ejercicio anterior (31 de diciembre), que es como lo pide la NIIF.' : 'Al cierre de cada mes.'}</div>
+      ${tablaComparada(X.esf, m==='anual' ? [X.tits[0], '31-12-' + (S.emp.ejercicio-1)] : X.tits)}</div>
+  </div>
+  <div class="row noprint"><button class="btn ghost sm" data-exp="comparativo">Exportar comparativo en CSV</button></div>`;
+}
+
+function mesesDelCorte(C){
+  const ej = S.emp.ejercicio, L = [];
+  for(let i = 0; i <= C.mesIdx; i++){ const ym = ej + '-' + String(i+1).padStart(2,'0'); L.push({ym, lista: asientosEntre(ym+'-01', finDeMes(ym))}); }
+  return L;
+}
+function eriMensual(C){
+  const M = mesesDelCorte(C), forma = formaEEFF(M.map(x=>x.lista));
+  const F = M.map(x=>filasEEFF(x.lista, forma).eri);
+  const filas = F[0].map((f, i)=>Object.assign({}, f, {vs: F.map(x=>x[i].v)}));
+  filas.forEach(f=>{ f.total = f.vs.reduce((a,b)=>a + (b||0), 0); });
+  return {meses: M, filas, res: M.map(x=>resumenERI(x.lista))};
+}
+function anMensual(C){
+  const X = eriMensual(C);
+  const gr = graficoMeses({cats: X.meses.map(x=>MESES[+x.ym.slice(5)-1].slice(0,3)), destacar: C.mesIdx, titulo:'Resultado de cada mes',
+    series:[{n:'Ingresos', v:X.res.map(r=>r.ing), c:'var(--ok)'}, {n:'Costos y gastos', v:X.res.map(r=>r.costo + r.gasto), c:'var(--bad)'}],
+    linea:{n:'Resultado', v:X.res.map(r=>r.neto), c:'var(--ink)'}});
+  const conRes = X.res.filter(r=>r.ing || r.costo || r.gasto);
+  const mejor = conRes.length ? X.res.reduce((b, r, i)=> r.neto > X.res[b].neto ? i : b, 0) : -1;
+  const peor = conRes.length ? X.res.reduce((b, r, i)=> r.neto < X.res[b].neto ? i : b, 0) : -1;
+  return `
+  <h2>Estado de resultados mes a mes · ${S.emp.ejercicio}</h2>
+  ${gr ? `<div class="card">${gr}<div class="tiny">${mejor >= 0 ? 'El mejor mes fue ' + MESES[mejor] + ' (' + $$(X.res[mejor].neto) + ') y el más débil ' + MESES[peor] + ' (' + $$(X.res[peor].neto) + ').' : ''}</div></div>` : '<div class="card"><p class="sub" style="margin:0">Todavía no hay ingresos ni gastos en el ejercicio.</p></div>'}
+  <div class="tw"><table>
+    <thead><tr><th>Concepto</th>${X.meses.map(x=>`<th class="n">${MESES[+x.ym.slice(5)-1].slice(0,3)}</th>`).join('')}<th class="n">Total</th></tr></thead>
+    <tbody>${X.filas.map(f=>filaMulti(f, f.vs.concat([f.total]))).join('')}</tbody></table></div>
+  <div class="row noprint"><button class="btn ghost sm" data-exp="mensual">Exportar mes a mes en CSV</button></div>`;
+}
+
+function anFlujo(C){
+  const FC = flujoCaja(C), PC = posicionCaja(C, FC), n = FC.n;
+  const cats = MESES.slice(0, n).map(m=>m.slice(0,3));
+  const gr = graficoMeses({cats, destacar: C.mesIdx, titulo:'Flujo de caja por mes',
+    series: SECC_FLUJO.map(([k, nom], i)=>({n: nom.replace('Actividades de ', ''), v: FC.secc[k].tot, c: ['var(--ok)', '#C08A6A', 'var(--debe)'][i]})),
+    linea: {n:'Saldo de caja', v: FC.fin, c:'var(--ink)'}});
+  const col = v => v.map(x=>`<td class="n">${R(x) ? fmt(x) : '<span class="z">—</span>'}</td>`).join('');
+  const tot = v => v.reduce((a,b)=>a+b, 0);
+  let filas = `<tr class="tot"><td>Saldo inicial de caja y banco</td>${col(FC.ini)}<td class="n">${fmt(FC.inicial)}</td></tr>`;
+  SECC_FLUJO.forEach(([k, nom])=>{
+    const L = FC.secc[k].lineas;
+    filas += `<tr class="sec"><td colspan="${n + 2}">${esc(nom)}</td></tr>`
+      + Object.keys(L).map(x=>`<tr><td>${esc(x)}</td>${col(L[x])}<td class="n">${fmt(tot(L[x]))}</td></tr>`).join('')
+      + `<tr class="tot"><td>Flujo de ${esc(nom.replace('Actividades de ', ''))}</td>${col(FC.secc[k].tot)}<td class="n">${fmt(FC.total[k])}</td></tr>`;
+  });
+  filas += `<tr class="tot"><td>Flujo neto del período</td>${col(FC.neto)}<td class="n">${fmt(FC.total.neto)}</td></tr>`
+         + `<tr class="tot"><td>Saldo final de caja y banco</td>${col(FC.fin)}<td class="n">${fmt(FC.fin[n-1])}</td></tr>`;
+  const t = FC.total;
+  const lectura = 'En el período la operación ' + (t.op >= 0 ? 'generó ' : 'consumió ') + $$(Math.abs(t.op))
+    + (t.inv ? ', en activo fijo se ' + (t.inv < 0 ? 'invirtieron ' : 'recuperaron ') + $$(Math.abs(t.inv)) : '')
+    + (t.fin ? ' y los dueños y bancos ' + (t.fin >= 0 ? 'aportaron ' : 'retiraron ') + $$(Math.abs(t.fin)) : '') + '. '
+    + (t.op < 0 ? 'Cuando la operación consume caja, el negocio se está financiando con aportes, préstamos o con la caja que ya tenía.' : '');
+  return `
+  <h2>Flujo de caja · método directo · ${esc(C.etiqueta)}</h2>
+  <div class="sub" style="margin-bottom:9px">Sale de los movimientos de caja y banco (${[...ctasDisponible()].map(esc).join(', ')}) del libro diario, ordenados según la cuenta del otro lado del asiento, como pide la sección 7 de la NIIF para las PYMES.</div>
+  <div class="kpis">
+    <div class="kpi"><div class="l">Operación</div><div class="v" style="color:${t.op<0?'var(--bad)':'var(--ink)'}">${$$(t.op)}</div><div class="s">cobros menos pagos del giro</div></div>
+    <div class="kpi"><div class="l">Inversión</div><div class="v">${$$(t.inv)}</div><div class="s">activo fijo</div></div>
+    <div class="kpi"><div class="l">Financiamiento</div><div class="v">${$$(t.fin)}</div><div class="s">dueños y préstamos</div></div>
+    <div class="kpi"><div class="l">Caja al corte</div><div class="v">${$$(FC.fin[n-1])}</div><div class="s">${FC.dif ? 'no calza con el mayor' : 'calza con el mayor'}</div></div>
+  </div>
+  ${gr ? `<div class="card">${gr}<div class="tiny">${esc(lectura)}</div></div>` : ''}
+  <div class="tw"><table>
+    <thead><tr><th>Concepto</th>${cats.map(c=>`<th class="n">${c}</th>`).join('')}<th class="n">Total</th></tr></thead>
+    <tbody>${filas}</tbody></table></div>
+  ${FC.dif ? `<div class="note warn">El saldo final del flujo (${$$(FC.fin[n-1])}) no calza con el saldo de caja y banco del mayor (${$$(FC.mayor)}) por ${$$(Math.abs(FC.dif))}. Suele ser un asiento descuadrado en caja o banco.</div>`
+           : `<div class="note ok">El saldo final calza con el mayor de caja y banco: ${$$(FC.mayor)}.</div>`}
+  <div class="card">
+    <h3>Posición de caja</h3>
+    <p class="sub">Lo que la caja tiene comprometido al corte: lo que falta cobrar y pagar según los auxiliares, y el F29 que vence el mes siguiente.</p>
+    <table><tbody>${PC.filas.map(x=>`<tr><td>${esc(x.n)}</td><td class="n">${$$(x.v)}</td></tr>`).join('')}
+      <tr class="tot"><td>Posición neta</td><td class="n">${$$(PC.neto)}</td></tr></tbody></table>
+    <div class="tiny" style="margin-top:6px">${PC.neto < 0 ? 'Con lo que hay y lo que falta cobrar no alcanza para cubrir lo comprometido: conviene adelantar cobranza o programar pagos.' : 'Lo comprometido queda cubierto, siempre que los clientes paguen lo que deben.'}</div>
+  </div>
+  <div class="row noprint"><button class="btn ghost sm" data-exp="flujo">Exportar flujo de caja en CSV</button></div>`;
+}
+
+function anCentros(C){
+  if(!(S.centros||[]).length) return `
+  <h2>Centros de costo</h2>
+  <div class="card"><p class="sub">Un centro de costo es una etiqueta que pones en cada ingreso y gasto para saber cuánto deja cada sucursal, proyecto, línea de negocio o área.</p>
+    <p class="sub">Créalos en Ajustes. Después aparecen al registrar documentos y asientos, y si importas un libro diario con una columna «Centro de costo» se asignan solos.</p>
+    <div class="row"><button class="btn" data-ir="config">Crear centros de costo</button></div></div>`;
+  const RC = resultadoPorCentro(C.lista), cols = RC.cols;
+  const totCta = c => cols.reduce((a,k)=>a + (RC.M[c][k]||0), 0);
+  const T = k => RC.T[k];
+  const sumT = campo => cols.reduce((a,k)=>a + T(k)[campo], 0);
+  const gastoTot = sumT('costo') + sumT('gasto'), sinG = RC.T[''] ? RC.T[''].costo + RC.T[''].gasto : 0;
+  const gr = graficoBarrasH(cols.map(k=>({n:nomCentro(k), v:T(k).res})), 'Resultado por centro de costo');
+  const celda = v => `<td class="n">${R(v) ? fmt(v) : '<span class="z">—</span>'}</td>`;
+  return `
+  <h2>Resultado por centro de costo · ${esc(C.etiqueta)}</h2>
+  ${gr ? `<div class="card">${gr}<div class="tiny">Verde: el centro deja utilidad; rojo: pierde. ${gastoTot && sinG ? Math.round(sinG/gastoTot*100) + '% de los costos y gastos todavía no tiene centro asignado.' : ''}</div></div>` : ''}
+  <div class="tw"><table>
+    <thead><tr><th>Cuenta</th>${cols.map(k=>`<th class="n">${esc(nomCentro(k))}</th>`).join('')}<th class="n">Total</th></tr></thead>
+    <tbody>
+      ${RC.ctas.map(c=>`<tr><td><span class="cod">${c}</span> ${esc(nomCta(c))}</td>${cols.map(k=>celda(RC.M[c][k]||0)).join('')}${celda(totCta(c))}</tr>`).join('')}
+      <tr class="tot"><td>Ingresos</td>${cols.map(k=>celda(T(k).ing)).join('')}${celda(sumT('ing'))}</tr>
+      <tr class="tot"><td>Costo de ventas</td>${cols.map(k=>celda(T(k).costo)).join('')}${celda(sumT('costo'))}</tr>
+      <tr class="tot"><td>Gastos</td>${cols.map(k=>celda(T(k).gasto)).join('')}${celda(sumT('gasto'))}</tr>
+      <tr class="tot"><td>Resultado</td>${cols.map(k=>celda(T(k).res)).join('')}${celda(sumT('res'))}</tr>
+      <tr><td class="tiny">Margen sobre ingresos</td>${cols.map(k=>`<td class="n tiny">${T(k).ing ? pct1(T(k).res/T(k).ing) : '—'}</td>`).join('')}<td class="n tiny">${sumT('ing') ? pct1(sumT('res')/sumT('ing')) : '—'}</td></tr>
+    </tbody></table></div>
+  <div class="tiny">El total de la derecha es el mismo resultado del estado de resultados al corte: ${$$(eri(C.lista).neto)}.</div>
+  <div class="row noprint"><button class="btn ghost sm" data-exp="centros">Exportar por centro en CSV</button></div>`;
+}
+
+/* ---- auxiliares por RUT ---- */
+function vAux(){
+  const lado = S.ui.auxLado === 'pro' ? 'pro' : 'cli', C = corte(), X = auxiliar(lado, C.hasta);
+  const quien = lado==='cli' ? 'clientes' : 'proveedores', verbo = lado==='cli' ? 'cobro' : 'pago';
+  const vencido = X.T.tramos.slice(1).reduce((a,b)=>a+b,0), muyVencido = X.T.tramos.slice(3).reduce((a,b)=>a+b,0);
+  const mayor = X.filas[0];
+  const tabla = X.filas.length ? `<div class="tw"><table>
+    <thead><tr><th>Contraparte</th>${TRAMOS_AUX.map(t=>`<th class="n op">${t[1]}</th>`).join('')}<th class="n">Saldo</th></tr></thead>
+    <tbody>${X.filas.map(g=>`<tr><td>${esc(g.nombre)}<div class="tiny">${g.rut?esc(fmtRut(g.rut)):'sin RUT'} · ${g.docs.length} doc.</div></td>
+      ${g.tramos.map(v=>`<td class="n op">${R(v)?fmt(v):'<span class="z">—</span>'}</td>`).join('')}<td class="n"><b>${fmt(g.total)}</b></td></tr>`).join('')}</tbody>
+    <tfoot><tr class="tot"><td>Total</td>${X.T.tramos.map(v=>`<td class="n op">${R(v)?fmt(v):''}</td>`).join('')}<td class="n">${fmt(X.T.total)}</td></tr></tfoot>
+  </table></div>` : `<div class="card"><p class="sub" style="margin:0">No hay ${quien} con saldo al ${esc(C.hasta)}. El auxiliar se arma con los documentos registrados a crédito.</p></div>`;
+  const hoyCorte = hoyISO() < C.hasta ? hoyISO() : C.hasta;
+  const detalle = X.filas.map(g=>`<details class="card"${S.ui.auxAbierto===g.k?" open":""}><summary><b>${esc(g.nombre)}</b> · ${g.rut?esc(fmtRut(g.rut)):'sin RUT'} · saldo ${$$(g.total)}${g.maxDias>90?' <span class="flag f-bad">más de 90 días</span>':g.maxDias>30?' <span class="flag f-warn">vencido</span>':''}</summary>
+    <div class="tw" style="margin-top:8px"><table>
+      <thead><tr><th>Documento</th><th>Fecha</th><th class="n">Días</th><th class="n">Monto</th><th class="n">${lado==='cli'?'Cobrado':'Pagado'}</th><th class="n">Saldo</th><th class="noprint">Registrar ${verbo}</th></tr></thead>
+      <tbody>${g.docs.map(x=>`<tr><td>${esc(dteAbr(x.d.dte))} N° ${esc(x.d.folio||'—')}${x.d.nc?' <span class="flag f-warn">NC</span>':''}</td>
+        <td class="cod">${esc(x.d.fecha)}</td><td class="n">${x.dias}</td><td class="n">${fmt(montoDoc(x.d)*(x.d.nc?-1:1))}</td>
+        <td class="n">${x.pagado?fmt(x.pagado):'<span class="z">—</span>'}</td><td class="n"><b>${fmt(x.p)}</b></td>
+        <td class="noprint">${x.d.nc ? '<span class="tiny">rebaja el saldo</span>' : `<div class="row" style="gap:4px;flex-wrap:nowrap">
+          <input type="date" id="axf_${x.d.id}" value="${hoyCorte}" style="width:132px">
+          <input type="text" inputmode="numeric" class="mny" id="axm_${x.d.id}" value="${fmt(x.p)}" style="width:100px">
+          <select id="axc_${x.d.id}" style="width:86px"><option value="${S.banco.cuenta||'1102'}">Banco</option><option value="1101">Caja</option></select>
+          <button class="btn sm" data-axpagar="${x.d.id}">Grabar</button></div>`}</td></tr>`).join('')}</tbody></table></div>
+  </details>`).join('');
+
+  return `
+  <div class="chips noprint">
+    <button class="chip" aria-pressed="${lado==='cli'}" data-axl="cli">Clientes</button>
+    <button class="chip" aria-pressed="${lado==='pro'}" data-axl="pro">Proveedores</button>
+    <span class="tiny" style="align-self:center;margin-left:6px">Corte: ${esc(C.etiqueta)} · se cambia en Balance</span>
+  </div>
+  <h2>Auxiliar de ${quien} por RUT</h2>
+  <div class="kpis">
+    <div class="kpi"><div class="l">Saldo por ${lado==='cli'?'cobrar':'pagar'}</div><div class="v">${$$(X.T.total)}</div><div class="s">${X.filas.length} contraparte(s) · ${X.T.docs} doc.</div></div>
+    <div class="kpi"><div class="l">Con más de 30 días</div><div class="v" style="color:${vencido>0?'var(--warn)':'var(--ink)'}">${$$(vencido)}</div><div class="s">${X.T.total>0?Math.round(vencido/X.T.total*100)+'% del saldo':'—'}</div></div>
+    <div class="kpi"><div class="l">Con más de 90 días</div><div class="v" style="color:${muyVencido>0?'var(--bad)':'var(--ink)'}">${$$(muyVencido)}</div><div class="s">${lado==='cli'?'candidato a deterioro':'riesgo de cobranza del proveedor'}</div></div>
+    <div class="kpi"><div class="l">Contra la cuenta ${X.cta}</div><div class="v" style="color:${Math.abs(X.dif)>2?'var(--bad)':'var(--ok)'}">${Math.abs(X.dif)>2?$$(X.dif):'cuadra'}</div><div class="s">saldo contable ${$$(X.contable)}</div></div>
+  </div>
+  ${Math.abs(X.dif)>2 ? `<div class="note warn">El auxiliar suma ${$$(X.T.total)} y la cuenta ${X.cta} ${esc(nomCta(X.cta))} tiene ${$$(X.contable)} al mismo corte. La diferencia de ${$$(Math.abs(X.dif))} suele venir de ${lado==='cli'?'cobros':'pagos'} registrados por asiento manual o en Banco sin amarrarlos al documento, de saldos de apertura sin detalle por RUT, o de documentos de otro ejercicio. ${lado==='cli'?'Cobra':'Paga'} desde aquí para que el documento quede saldado.</div>` : X.filas.length ? `<div class="note ok">El auxiliar cuadra con la cuenta ${X.cta} al ${esc(C.hasta)}.</div>` : ''}
+  ${mayor && X.T.total>0 && mayor.total/X.T.total>0.4 ? `<div class="note">${esc(mayor.nombre)} concentra el ${Math.round(mayor.total/X.T.total*100)}% del saldo de ${quien}.</div>` : ''}
+  ${tabla}
+  ${detalle}
+  <div class="row noprint" style="margin-top:8px"><button class="btn ghost sm" data-exp="auxiliar">Exportar auxiliar en CSV</button></div>`;
+}
+
 function det(lista, cods, invertir){
   const m = saldos(lista);
   return cods.map(c=>{
@@ -5837,9 +6564,7 @@ function det(lista, cods, invertir){
 }
 /* ---- balance, ESF, ERI ---- */
 function vBalance(){
-  const todo = S.ui.balanceTodo === true;
-  const corte = ymActual();
-  const lista = todo ? asientosDelEjercicio() : asientosHasta(corte);
+  const C = corte(), todo = C.todo, lista = C.lista;
   if(!lista.length) return `
     <div class="chips noprint">
       <button class="chip" aria-pressed="${!todo}" data-bal="mes">Acumulado a ${MESES[S.ui.mes]}</button>
@@ -5849,7 +6574,7 @@ function vBalance(){
     <p class="sub">El balance y los estados se arman solos apenas registres el primer documento o asiento.</p>
     <div class="row"><button class="btn" data-nuevo="venta">Registrar una venta</button><button class="btn ghost" data-ir="diario">Asiento manual</button></div></div>`;
 
-  const b = balance8(lista), E = esf(lista), r = eri(lista);
+  const b = balance8(lista), F = filasEEFF(lista), E = F.E, r = F.r, cv = controlVentas(C);
   const util = b.util;
   const posteriores = asientosDelEjercicio().length - lista.length;
 
@@ -5874,17 +6599,6 @@ function vBalance(){
   ctrl.forEach(x=>{ x.dif = R(x.a) - R(x.c); x.ok = Math.abs(x.dif) <= 2; });
   const sano = ctrl.every(x=>x.ok);
 
-  // Filas de detalle de un grupo, leyendo el plan en vez de una lista fija.
-  const grupo = (filtro, invertir) => {
-    const m = saldos(lista);
-    return Object.keys(m).sort().filter(c=>{ const t = CTA[c]; return t && filtro(t); }).map(c=>{
-      const v = (m[c].debe - m[c].haber) * (invertir?-1:1);
-      if(R(v)===0) return '';
-      return '<tr><td><span class="cod">'+c+'</span> '+esc(nomCta(c))+'</td><td class="n">'+$$(v)+'</td></tr>';
-    }).join('');
-  };
-  const l = (n,v) => `<tr><td>${n}</td><td class="n">${$$(v)}</td></tr>`;
-
   return `
   <div class="chips noprint">
     <button class="chip" aria-pressed="${!todo}" data-bal="mes">Acumulado a ${MESES[S.ui.mes]}</button>
@@ -5893,8 +6607,7 @@ function vBalance(){
 
   <h2>Balance tributario de 8 columnas</h2>
   <div class="sub" style="margin-bottom:9px">${esc(S.emp.nombre||'')} · ejercicio ${S.emp.ejercicio} ·
-    ${todo ? 'todos los asientos del año' : 'desde el 1 de enero hasta el fin de '+MESES[S.ui.mes]}
-    · ${lista.length} asiento(s)</div>
+    ${esc(C.etiqueta)} · cifra de control: ${esc(controlCorte(C))}</div>
   ${(!todo && posteriores) ? `<div class="note">Hay ${posteriores} asiento(s) con fecha posterior a ${MESES[S.ui.mes]} que no entran en este corte. Si comparas contra un balance hecho a otra fecha, revisa que sea el mismo período.</div>` : ''}
   ${E.fuera && E.fuera.length ? `<div class="note warn">Hay movimientos en cuentas que no están en el plan (${E.fuera.map(esc).join(', ')}). Se están mostrando como activo. Agrégalas al plan o corrige los asientos.</div>` : ''}
 
@@ -5932,27 +6645,7 @@ function vBalance(){
   <div class="split2" style="margin-top:14px">
     <div class="card">
       <h3>Estado de situación financiera</h3>
-      <table><tbody>
-        <tr class="sec"><td colspan="2">Activo corriente</td></tr>
-        ${grupo(t=>(t.tipo==='activo'||t.tipo==='activoC') && t.clase==='c')}
-        <tr class="tot"><td>Total activo corriente</td><td class="n">${$$(E.ac)}</td></tr>
-        <tr class="sec"><td colspan="2">Activo no corriente</td></tr>
-        ${grupo(t=>(t.tipo==='activo'||t.tipo==='activoC') && t.clase==='nc')}
-        <tr class="tot"><td>Total activo no corriente</td><td class="n">${$$(E.anc)}</td></tr>
-        <tr class="tot"><td>Total activo</td><td class="n">${$$(E.activo)}</td></tr>
-        <tr class="sec"><td colspan="2">Pasivo corriente</td></tr>
-        ${grupo(t=>t.tipo==='pasivo' && t.clase==='c', true)}
-        <tr class="tot"><td>Total pasivo corriente</td><td class="n">${$$(E.pc)}</td></tr>
-        ${E.pnc?`<tr class="sec"><td colspan="2">Pasivo no corriente</td></tr>
-        ${grupo(t=>t.tipo==='pasivo' && t.clase==='nc', true)}
-        <tr class="tot"><td>Total pasivo no corriente</td><td class="n">${$$(E.pnc)}</td></tr>`:''}
-        <tr class="sec"><td colspan="2">Patrimonio</td></tr>
-        ${grupo(t=>t.tipo==='patrimonio', true)}
-        ${grupo(t=>t.tipo==='patrimonioD', true)}
-        ${l('Resultado del ejercicio', E.res)}
-        <tr class="tot"><td>Total patrimonio</td><td class="n">${$$(E.patrimonio)}</td></tr>
-        <tr class="tot"><td>Total pasivo y patrimonio</td><td class="n">${$$(E.total)}</td></tr>
-      </tbody></table>
+      <table><tbody>${tablaFilas(F.esf)}</tbody></table>
       ${Math.abs(E.activo-E.total)>2
         ? `<div class="note warn">Diferencia de ${$$(Math.abs(E.activo-E.total))} entre activo y pasivo más patrimonio.</div>`
         : '<div class="note ok">La ecuación patrimonial cuadra.</div>'}
@@ -5960,25 +6653,13 @@ function vBalance(){
 
     <div class="card">
       <h3>Estado de resultados</h3>
-      <table><tbody>
-        <tr class="sec"><td colspan="2">Ingresos de actividades ordinarias</td></tr>
-        ${grupo(t=>t.tipo==='ingreso' && t.sub!=='otros', true)}
-        <tr class="sec"><td colspan="2">Costo de ventas</td></tr>
-        ${grupo(t=>t.tipo==='gasto' && t.sub==='costo')}
-        <tr class="tot"><td>Margen bruto</td><td class="n">${$$(r.bruto)}</td></tr>
-        <tr class="sec"><td colspan="2">Gastos de administración y ventas</td></tr>
-        ${grupo(t=>t.tipo==='gasto' && (t.sub==='operacional'||!t.sub))}
-        ${r.otrosIng?`<tr class="sec"><td colspan="2">Otros ingresos</td></tr>
-        ${grupo(t=>t.tipo==='ingreso' && t.sub==='otros', true)}`:''}
-        <tr class="tot"><td>Resultado operacional</td><td class="n">${$$(r.operacional)}</td></tr>
-        ${r.fin?grupo(t=>t.tipo==='gasto' && t.sub==='financiero'):l('Gastos financieros', 0)}
-        <tr class="tot"><td>Resultado antes de impuesto</td><td class="n">${$$(r.antesImp)}</td></tr>
-        ${r.imp?grupo(t=>t.tipo==='gasto' && t.sub==='impuesto'):l('Impuesto a la renta', 0)}
-        <tr class="tot"><td>Resultado del ejercicio</td><td class="n">${$$(r.neto)}</td></tr>
-      </tbody></table>
+      <table><tbody>${tablaFilas(F.eri)}</tbody></table>
       <div class="tiny" style="margin-top:8px">Bajo NIIF para las PYMES, criterio de devengo. Los gastos se muestran por función. La tercera edición de la norma rige desde enero de 2027.</div>
+      ${Math.abs(cv.dif) > 2 ? `<div class="note warn">Los ingresos contables (${$$(cv.cont)}) no calzan con las ventas netas de los documentos del F29 (${$$(cv.f29)}): hay ${$$(Math.abs(cv.dif))} ${cv.dif>0?'de ingresos registrados por asiento sin documento':'en documentos cuyo asiento no está en el diario'}.</div>` : ''}
     </div>
   </div>
+
+  ${botonesExportar()}
 
   <div class="card">
     <h3>Control de armado</h3>
@@ -6171,13 +6852,72 @@ function vPlan(){
 
 /* ---- cierre: activo fijo y corrección monetaria ---- */
 function vCierre(){
-  return S.ui.cierreModo === 'cm' ? vCorreccion() : vActivoFijo();
+  const m = S.ui.cierreModo || 'pe';
+  return m === 'cm' ? vCorreccion() : m === 'af' ? vActivoFijo() : vPeriodos();
 }
 function chipsCierre(m){
   return `<div class="chips noprint">
+    <button class="chip" aria-pressed="${m==='pe'}" data-ci="pe">Períodos</button>
     <button class="chip" aria-pressed="${m==='af'}" data-ci="af">Activo fijo y depreciación</button>
     <button class="chip" aria-pressed="${m==='cm'}" data-ci="cm">Corrección monetaria</button>
   </div>`;
+}
+
+// Lo que conviene tener listo antes de cerrar un mes. Solo bloquea el cierre
+// lo que dejaría números malos (un comprobante descuadrado); lo demás avisa.
+function revisionPeriodo(ym){
+  const as = S.asientos.filter(a=>ymOf(a.fecha)===ym);
+  const desc = as.filter(a=>{ let d=0,h=0; a.lineas.forEach(l=>{d+=num(l.d);h+=num(l.h)}); return R(d)!==R(h); });
+  const docs = docsMes(ym);
+  const sinAsiento = docs.filter(x=>!(x.asientos||[]).some(id=>S.asientos.some(a=>a.id===id)));
+  const movs = ((S.banco && S.banco.movs)||[]).filter(m=>ymOf(m.fecha)===ym);
+  const sinConc = movs.length ? emparejar().soloBanco.filter(m=>ymOf(m.fecha)===ym && !m.aid).length : 0;
+  const mi = +ym.slice(5) - 1, f = ym.slice(0,4)==String(S.emp.ejercicio) ? f29Ano()[mi] : null;
+  const ivaPend = f && (f.debito || f.cred) && !as.some(a=>a.origen==='f29');
+  const depPend = (S.activos||[]).length && asientoDepreciacionMes(ym) && !as.some(a=>a.origen==='dep');
+  const ant = mi > 0 ? ym.slice(0,4)+'-'+String(mi).padStart(2,'0') : null;
+  const C = [
+    {ok:!desc.length, bloquea:true, n:'Todos los comprobantes cuadran', det: desc.length ? desc.map(etiquetaCbte).join(', ')+' no cuadra(n)' : as.length+' comprobante(s)'},
+    {ok:!sinAsiento.length, n:'Cada documento tiene su asiento', det: sinAsiento.length ? sinAsiento.length+' documento(s) sin asiento en el diario' : docs.length+' documento(s)'},
+    {ok:!sinConc, n:'Cartola del mes conciliada', det: !movs.length ? 'sin cartola cargada para el mes' : sinConc ? sinConc+' movimiento(s) del banco sin asiento' : movs.length+' movimiento(s) conciliados'},
+    {ok:!ivaPend, n:'Determinación del IVA asentada', det: ivaPend ? 'el F29 tiene movimiento y no hay asiento de IVA del mes' : f && (f.debito||f.cred) ? 'registrada' : 'sin IVA en el mes'},
+    {ok:!depPend, n:'Depreciación del mes registrada', det: depPend ? 'hay activos fijos y falta la depreciación' : (S.activos||[]).length ? 'registrada' : 'sin activo fijo'},
+    {ok:!ant || periodoCerrado(ant+'-01'), n:'El mes anterior está cerrado', det: !ant ? 'es el primer mes del año' : periodoCerrado(ant+'-01') ? 'sí' : MESES[mi-1]+' sigue abierto'}
+  ];
+  let debe = 0; as.forEach(a=>a.lineas.forEach(l=>debe+=num(l.d)));
+  return {ym, C, puede: C.every(x=>x.ok || !x.bloquea), n:as.length, debe:R(debe), docs:docs.length, f29: f ? f.total : 0};
+}
+function vPeriodos(){
+  const ej = S.emp.ejercicio, ymSel = ymActual(), rv = revisionPeriodo(ymSel), cerrado = periodoCerrado(ymSel+'-01');
+  const filas = MESES.map((nom, i)=>{
+    const ym = ej+'-'+String(i+1).padStart(2,'0'), c = S.cierres && S.cierres[ym];
+    const as = S.asientos.filter(a=>ymOf(a.fecha)===ym);
+    let d = 0; as.forEach(a=>a.lineas.forEach(l=>d+=num(l.d)));
+    return `<tr${ym===ymSel?' style="outline:2px solid var(--ok);outline-offset:-2px"':''}>
+      <td><button class="btn sm ghost" data-pemes="${i}" style="padding:1px 8px">${nom}</button></td>
+      <td class="n">${as.length||''}</td><td class="n">${d?fmt(d):''}</td><td class="n">${docsMes(ym).length||''}</td>
+      <td>${c ? '<span class="flag f-ok">cerrado</span> <span class="tiny">'+esc((c.cuando||'').slice(0,10))+'</span>' : '<span class="flag f-mute">abierto</span>'}</td></tr>`;
+  }).join('');
+  const bit = (S.bitacora||[]).filter(x=>x.accion==='cierre'||x.accion==='reapertura').slice(-12).reverse();
+  return chipsCierre('pe') + `
+  <h2>Cierre de períodos · ejercicio ${ej}</h2>
+  <div class="sub" style="margin-bottom:10px">Un mes cerrado queda fijo: no se graban ni se borran documentos o comprobantes con esa fecha. Es lo que asegura que el F29 declarado y el balance entregado no cambien después.</div>
+  <div class="split2">
+    <div class="tw"><table>
+      <thead><tr><th>Mes</th><th class="n">Comprobantes</th><th class="n">Debe</th><th class="n">Docs</th><th>Estado</th></tr></thead>
+      <tbody>${filas}</tbody></table></div>
+    <div class="card">
+      <h3>${MESES[S.ui.mes]} ${ej} · ${cerrado ? 'cerrado' : 'revisión antes de cerrar'}</h3>
+      ${rv.C.map(x=>`<div class="as-l"><span>${x.ok?'✓':x.bloquea?'✕':'!'} ${esc(x.n)}<div class="tiny">${esc(x.det)}</div></span>
+        <em class="${x.ok?'':'f-'+(x.bloquea?'bad':'warn')}">${x.ok?'listo':x.bloquea?'impide cerrar':'revisar'}</em></div>`).join('')}
+      ${cerrado ? `<div class="note ok">Cerrado el ${esc(S.cierres[ymSel].cuando.slice(0,16).replace('T',' '))} con ${S.cierres[ymSel].n} comprobante(s) por $ ${fmt(S.cierres[ymSel].debe)}.</div>
+          <div class="row noprint"><button class="btn ghost" data-peabrir="${ymSel}">Reabrir ${MESES[S.ui.mes]}</button></div>`
+        : rv.puede ? `<div class="row noprint" style="margin-top:10px"><button class="btn" data-pecerrar="${ymSel}">Cerrar ${MESES[S.ui.mes]}</button></div>
+          ${rv.C.some(x=>!x.ok) ? '<div class="tiny" style="margin-top:6px">Puedes cerrar igual: los puntos marcados con ! no descuadran nada, pero conviene revisarlos.</div>' : ''}`
+        : `<div class="note warn">Corrige los comprobantes descuadrados antes de cerrar.</div>`}
+    </div>
+  </div>
+  ${bit.length ? `<div class="card"><h3>Bitácora de cierres</h3>${bit.map(x=>`<div class="as-l"><span>${x.accion==='cierre'?'Cierre':'Reapertura'} de ${esc(x.detalle)}</span><em class="tiny">${esc(x.cuando.slice(0,16).replace('T',' '))}</em></div>`).join('')}</div>` : ''}`;
 }
 
 function vActivoFijo(){
@@ -6754,6 +7494,25 @@ function tarjetaQR(){
 }
 
 /* ---- ajustes ---- */
+function vCentros(){
+  const L = S.centros || [];
+  return `<div class="card">
+    <h3>Centros de costo</h3>
+    <p class="sub">Sucursales, proyectos, líneas de negocio o áreas. Se asignan a los ingresos y gastos al registrar documentos y asientos, y el resultado de cada uno se ve en Análisis › Centros de costo.</p>
+    ${L.length ? L.map(c=>`<div class="as-l"><span><span class="cod">${esc(c[0])}</span> ${esc(c[1])}</span>
+      <em class="noprint">${centroEnUso(c[0]) ? '<span class="tiny">en uso</span>' : `<button class="btn sm danger" data-ccdel="${esc(c[0])}" style="padding:1px 7px;font-size:12px">✕</button>`}</em></div>`).join('') : '<div class="tiny">Todavía no hay centros de costo.</div>'}
+    <div class="grid2 noprint" style="margin-top:10px">
+      <div><label>Código</label><input id="cc_cod" placeholder="SUC1" maxlength="10"></div>
+      <div><label>Nombre</label><input id="cc_nom" placeholder="Sucursal Centro"></div>
+    </div>
+    <div class="row noprint" style="margin-top:8px"><button class="btn ghost" id="cc_add">Agregar centro</button></div>
+  </div>`;
+}
+// Selector de centro de costo; vacío si la empresa no usa centros.
+function selCentro(id, actual, clase){
+  if(!(S.centros||[]).length) return '';
+  return `<select ${id ? 'id="'+id+'"' : ''} class="${clase||''}" title="Centro de costo"><option value="">Sin centro</option>${S.centros.map(c=>`<option value="${esc(c[0])}"${c[0]===actual?' selected':''}>${esc(c[0])} · ${esc(c[1])}</option>`).join('')}</select>`;
+}
 function vConfig(){
   const e = S.emp, p = S.par;
   return `
@@ -6779,13 +7538,14 @@ function vConfig(){
 
 
   ${vPlanCuentas()}
+  ${vCentros()}
   ${vParametros()}
   <div class="card">
     <h3>Tus datos</h3>
     <p class="sub">Todo queda en este dispositivo. No se envía a ningún servidor. Exporta cada cierto tiempo: si borras los datos del navegador, se pierden.</p>
     <div class="row">
       <button class="btn" id="x_json">Exportar respaldo</button>
-      <button class="btn ghost" id="x_csv">Exportar diario en CSV</button>
+      <button class="btn ghost" id="x_csv" title="Usa el mismo corte del Balance: ${esc(corte().etiqueta)}">Exportar diario en CSV</button>
       <button class="btn ghost" id="x_imp">Importar respaldo</button>
       <button class="btn ghost" onclick="window.print()">Imprimir esta vista</button>
     </div>
@@ -6839,8 +7599,8 @@ function render(){
   const nav = document.getElementById('nav');
   nav.innerHTML = VISTAS.map(v=>`<button data-v="${v[0]}" aria-current="${S.ui.vista===v[0]}">${v[1]}</button>`).join('');
   const v = S.ui.vista;
-  const html = v==='panel'?vPanel():v==='docs'?vDocs():v==='banco'?vBanco():v==='remun'?vRemun():v==='diario'?vDiario():v==='mayor'?vMayor():
-               v==='balance'?vBalance():v==='f29'?vF29():v==='plan'?vPlan():v==='cierre'?vCierre():v==='revisor'?vRevisor():v==='compartir'?vCompartir():v==='cuadre'?vCuadre():vConfig();
+  const html = v==='panel'?vPanel():v==='docs'?vDocs():v==='banco'?vBanco():v==='remun'?vRemun():v==='diario'?vDiario():v==='mayor'?vMayor():v==='aux'?vAux():
+               v==='balance'?vBalance():v==='analisis'?vAnalisis():v==='f29'?vF29():v==='plan'?vPlan():v==='cierre'?vCierre():v==='revisor'?vRevisor():v==='compartir'?vCompartir():v==='cuadre'?vCuadre():vConfig();
   document.getElementById('app').innerHTML = html;
   if(memoria){
     const e = document.getElementById(memoria.id);
@@ -6868,10 +7628,11 @@ function render(){
 
 function pintaLineas(){
   const box = document.getElementById('a_lineas'); if(!box) return;
-  box.innerHTML = lineas.map((l,i)=>lineaHTML(i,l.c,l.d,l.h)).join('');
+  box.innerHTML = lineas.map((l,i)=>lineaHTML(i,l.c,l.d,l.h,l.cc)).join('');
   box.querySelectorAll('[data-lin]').forEach(row=>{
     const i = +row.dataset.lin;
-    row.querySelector('.l_c').addEventListener('change', e=>{ lineas[i].c=e.target.value; });
+    row.querySelector('.l_c').addEventListener('change', e=>{ lineas[i].c=e.target.value; pintaLineas(); });
+    const cc = row.querySelector('.l_cc'); if(cc) cc.addEventListener('change', e=>{ lineas[i].cc=e.target.value; });
     const cd = row.querySelector('.l_d'), ch = row.querySelector('.l_h');
     cd.addEventListener('input', e=>{ lineas[i].d=e.target.value; if(numCSV(e.target.value)) { lineas[i].h=''; ch.value=''; } sumaLineas(); });
     ch.addEventListener('input', e=>{ lineas[i].h=e.target.value; if(numCSV(e.target.value)) { lineas[i].d=''; cd.value=''; } sumaLineas(); });
@@ -6882,7 +7643,16 @@ function sumaLineas(){
   const d = lineas.reduce((a,l)=>a+numCSV(l.d),0), h = lineas.reduce((a,l)=>a+numCSV(l.h),0);
   const e = document.getElementById('a_sum'); if(!e) return;
   e.innerHTML = `Debe ${fmt(d)} · Haber ${fmt(h)} · ` +
-    (d===h && d>0 ? '<span class="f-ok">cuadra</span>' : d===h ? 'sin montos' : '<span class="f-bad">diferencia '+fmt(Math.abs(d-h))+'</span>');
+    (d===h && d>0 ? '<span class="f-ok">cuadra</span>' : d===h ? 'sin montos' : '<span class="f-bad">diferencia '+fmt(Math.abs(d-h))+'</span>') +
+    (d>0 ? ' · se grabará como ' + esc(proximoCbte()) : '');
+}
+// Tipo y folio que tendría el asiento manual si se graba ahora.
+function proximoCbte(){
+  const ls = lineas.map(l=>({c:l.c, d:numCSV(l.d), h:numCSV(l.h)}));
+  const tipo = val('a_tipo') || tipoComprobante(ls);
+  const ano = (val('a_fecha') || hoyISO()).slice(0,4);
+  const f = (S.folios||{})[ano] || {};
+  return TIPOS_CBTE[tipo] + ' N° ' + ((f[tipo]||0) + 1);
 }
 function cargaPlantilla(k){
   const fechaEl = document.getElementById('a_fecha');
@@ -6926,9 +7696,11 @@ function bindForm(){
       condicion: val('f_cond'), cuenta: val('f_cta'),
       creditoIva: docClase==='compra' ? !!val('f_cred') : false,
       costo: docClase==='venta' ? valM('f_costo') : 0,
+      cc: val('f_cc') || '',
       nc: !!val('f_nc')
     };
     if(d.dte==='61') d.nc = true;
+    S.ui.ultCentro = d.cc;
     registrarDoc(d); guardar(); docClase=null; render(); toast('Documento y asiento registrados');
   };
 }
@@ -6952,12 +7724,66 @@ function bindPlan(){
 /* ---- eventos globales ---- */
 document.addEventListener('click', e=>{
   const t = e.target.closest('button'); if(!t) return;
+  // Lo que un mes cerrado impidió grabar se avisa después del toast propio de cada acción.
+  bloqueos.length = 0;
+  setTimeout(()=>{ if(bloqueos.length){ toast(textoBloqueos()); bloqueos.length = 0; } }, 30);
+  if(t.dataset.exp){ exportar(t.dataset.exp); return; }
   if(t.dataset.v){ S.ui.vista=t.dataset.v; docClase=null; guardar(); render(); return; }
-  if(t.dataset.ir){ S.ui.vista=t.dataset.ir; guardar(); render(); return; }
+  if(t.dataset.ir){ S.ui.vista=t.dataset.ir; if(t.dataset.cim) S.ui.cierreModo=t.dataset.cim; guardar(); render(); return; }
+  if(t.id==='cc_add'){
+    const cod = String(val('cc_cod')).trim().toUpperCase(), nom = String(val('cc_nom')).trim();
+    if(!cod || !nom){ toast('Falta el código o el nombre'); return; }
+    S.centros = S.centros || [];
+    if(S.centros.some(c=>c[0]===cod)){ toast('Ese código ya existe'); return; }
+    S.centros.push([cod, nom]); guardar(); render(); toast('Centro de costo agregado'); return;
+  }
+  if(t.dataset.ccdel){
+    if(centroEnUso(t.dataset.ccdel)){ toast('Ese centro tiene movimientos: no se puede borrar'); return; }
+    S.centros = S.centros.filter(c=>c[0]!==t.dataset.ccdel); guardar(); render(); toast('Centro borrado'); return;
+  }
+  if(t.dataset.an){ S.ui.anModo=t.dataset.an; guardar(); render(); return; }
+  if(t.dataset.cmp){ S.ui.cmpModo=t.dataset.cmp; guardar(); render(); return; }
+  if(t.dataset.axl){ S.ui.auxLado=t.dataset.axl; guardar(); render(); return; }
+  if(t.dataset.axpagar){
+    const id = t.dataset.axpagar, d = S.docs.find(x=>x.id===id); if(!d) return;
+    const fecha = val('axf_'+id), monto = valM('axm_'+id), pend = R(pendienteDoc(d));
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(fecha)){ toast('Falta la fecha'); return; }
+    if(monto<=0){ toast('Falta el monto'); return; }
+    if(monto>pend+1){ toast('El monto supera el saldo del documento ('+fmt(pend)+')'); return; }
+    if(fecha<d.fecha){ toast('La fecha es anterior al documento'); return; }
+    const a = registrarPagoDoc(d, fecha, monto, val('axc_'+id));
+    S.ui.auxAbierto = normRut(d.rut) || 'sin:' + normCab(d.contraparte||'sin nombre');
+    if(!a) return;
+    guardar(); render(); toast(etiquetaCbte(a)+' grabado · saldo '+fmt(R(pendienteDoc(d)))); return;
+  }
+  if(t.dataset.fcb){ S.ui.filtroCbte=t.dataset.fcb; guardar(); render(); return; }
+  if(t.dataset.cbte){
+    const a = S.asientos.find(x=>x.id===t.dataset.cbte); if(!a) return;
+    const w = window.open('', '_blank');
+    if(w){ w.document.write(htmlComprobante(a)); w.document.close(); } else toast('El navegador bloqueó la ventana');
+    return;
+  }
   if(t.dataset.nuevo){ docClase=t.dataset.nuevo; S.ui.vista='docs'; render(); return; }
   if(t.dataset.fil){ S.ui.filtroDoc=t.dataset.fil; render(); return; }
   if(t.dataset.rm){ S.ui.remunModo=t.dataset.rm; guardar(); render(); return; }
   if(t.dataset.ci){ S.ui.cierreModo=t.dataset.ci; guardar(); render(); return; }
+  if(t.dataset.pemes){ S.ui.mes=+t.dataset.pemes; const sm=document.getElementById('selMes'); if(sm) sm.value=S.ui.mes; guardar(); render(); return; }
+  if(t.dataset.pecerrar){
+    const ym = t.dataset.pecerrar, rv = revisionPeriodo(ym);
+    if(!rv.puede){ toast('Hay comprobantes descuadrados: no se puede cerrar'); return; }
+    S.cierres = S.cierres || {};
+    S.cierres[ym] = {cuando:new Date().toISOString(), n:rv.n, debe:rv.debe, docs:rv.docs, f29:rv.f29};
+    anotar('cierre', MESES[+ym.slice(5)-1]+' '+ym.slice(0,4)+' · '+rv.n+' comprobante(s) · $ '+fmt(rv.debe), {ym});
+    guardar(); render(); toast(MESES[+ym.slice(5)-1]+' cerrado'); return;
+  }
+  if(t.dataset.peabrir){
+    const ym = t.dataset.peabrir;
+    const motivo = prompt('¿Por qué se reabre '+MESES[+ym.slice(5)-1]+'? Queda anotado en la bitácora.');
+    if(motivo===null) return;
+    delete S.cierres[ym];
+    anotar('reapertura', MESES[+ym.slice(5)-1]+' '+ym.slice(0,4)+(motivo.trim()?' · '+motivo.trim():''), {ym});
+    guardar(); render(); toast(MESES[+ym.slice(5)-1]+' reabierto'); return;
+  }
   if(t.dataset.lbmodo){
     lib.modo = t.dataset.lbmodo;
     lib.an = analizarLibro('', lib.modo, S.emp.ejercicio, filasDeHoja(lib) || lib.filas);
@@ -7159,8 +7985,9 @@ document.addEventListener('click', e=>{
     const d = lineas.reduce((a,l)=>a+numCSV(l.d),0), h = lineas.reduce((a,l)=>a+numCSV(l.h),0);
     if(d===0 && h===0){ toast('El asiento no tiene montos'); return; }
     if(R(d)!==R(h)){ toast('No cuadra: diferencia de '+fmt(Math.abs(d-h))); return; }
-    addAsiento(val('a_fecha')||hoyISO(), val('a_glosa')||'Asiento manual', lineas.map(l=>({c:l.c,d:numCSV(l.d),h:numCSV(l.h)})), origenAsiento);
-    lineas=[{c:'1101',d:'',h:''},{c:'4101',d:'',h:''}]; origenAsiento='manual'; guardar(); render(); toast('Asiento grabado'); return;
+    const a = addAsiento(val('a_fecha')||hoyISO(), val('a_glosa')||'Asiento manual', lineas.map(l=>({c:l.c,d:numCSV(l.d),h:numCSV(l.h),cc:l.cc})), origenAsiento, null, val('a_tipo'));
+    if(!a) return;                        // mes cerrado: se avisa y se conservan las líneas
+    lineas=[{c:'1101',d:'',h:''},{c:'4101',d:'',h:''}]; origenAsiento='manual'; guardar(); render(); toast(etiquetaCbte(a)+' grabado'); return;
   }
   if(t.id==='c_save'){
     S.emp.nombre=val('c_nom'); S.emp.rut=val('c_rut'); S.emp.regimen=val('c_reg');
@@ -7194,12 +8021,7 @@ document.addEventListener('click', e=>{
     return;
   }
   if(t.id==='x_json'){ bajar('cuadratura-'+S.emp.ejercicio+'.json', JSON.stringify(S,null,1), 'application/json'); return; }
-  if(t.id==='x_csv'){
-    const f = ['Asiento;Fecha;Codigo;Cuenta;Glosa;Debe;Haber'];
-    asientosDelEjercicio().forEach(a=>a.lineas.forEach(l=>
-      f.push([a.n,a.fecha,l.c,nomCta(l.c),(a.glosa||'').replace(/;/g,','),l.d||0,l.h||0].join(';'))));
-    bajar('libro-diario-'+S.emp.ejercicio+'.csv', '\ufeff'+f.join('\n'), 'text/csv'); return;
-  }
+  if(t.id==='x_csv'){ exportar('diario'); return; }
   if(t.id==='x_imp'){ document.getElementById('x_file').click(); return; }
   if(t.id==='x_del'){
     if(confirm('Se borran documentos, asientos y configuración. ¿Seguro?')){ S=estadoInicial(); guardar(); render(); toast('Datos borrados'); }
@@ -7208,6 +8030,7 @@ document.addEventListener('click', e=>{
 });
 document.addEventListener('change', e=>{
   if(e.target.id==='a_pl'){ cargaPlantilla(e.target.value); }
+  if(e.target.id==='a_tipo' || e.target.id==='a_fecha'){ sumaLineas(); }
   if(e.target.id==='m_cta'){ S.ui.ctaMayor=e.target.value; guardar(); render(); }
   if(e.target.id==='x_file'){
     const f = e.target.files[0]; if(!f) return;
