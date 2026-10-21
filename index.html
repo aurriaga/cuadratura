@@ -404,6 +404,18 @@ async function sincronizar(silencioso){
     } else out.falla.push('la respuesta de indicadores vino incompleta');
   }catch(e){ out.falla.push('no se pudo conectar a mindicador.cl'); }
 
+  // 1b. UTM mes a mes del ejercicio y del siguiente: con ella se reajusta el remanente del F29
+  try{
+    S.par.utmMes = S.par.utmMes || {};
+    let n = 0;
+    for(const a of [S.emp.ejercicio, S.emp.ejercicio + 1]){
+      const r = await fetch('https://mindicador.cl/api/utm/' + a, {cache:'no-store'});
+      const j = await r.json();
+      (j.serie||[]).forEach(x=>{ const k = (x.fecha||'').slice(0,7); if(k){ S.par.utmMes[k] = x.valor; n++; } });
+    }
+    if(n) out.ok.push('UTM de ' + n + ' meses');
+  }catch(e){ out.falla.push('no se pudo traer la UTM mensual'); }
+
   // 2. Tabla de parámetros. Si no configuraste una dirección, se busca sola
   //    junto a la app: publicar la carpeta alcanza, no hay que ajustar nada.
   const auto = location.protocol.indexOf('http')===0;
@@ -498,6 +510,46 @@ function reconstruirPlan(){
   filas.forEach(c=>{ CTA[c[0]] = {cod:c[0], nom:c[1], tipo:c[2], clase:c[3], sub:c[4]||'',
                                   propia: PLAN.findIndex(x=>x[0]===c[0]) < 0}; });
   PLAN_ACT = Object.keys(CTA).sort().map(k=>[CTA[k].cod, CTA[k].nom, CTA[k].tipo, CTA[k].clase, CTA[k].sub]);
+  ROLES = null;
+}
+// Función de cada cuenta, como en los sistemas contables: con ella la app sabe
+// cuál es el efectivo, quiénes son clientes y proveedores, o dónde está el IVA,
+// aunque el plan sea el del cliente y sus códigos no se parezcan a los de la app.
+let ROLES = null;
+const ROL_BASE = {'1101':'efectivo','1102':'efectivo','1103':'clientes','1104':'clientes','1106':'ivaCred','1108':'ppm','1110':'ilaCred',
+  '2101':'proveedores','2102':'proveedores','2103':'ivaDeb','2104':'personal','2105':'impuestos','2106':'personal','2107':'personal','2109':'ilaDeb','2110':'impuestos'};
+function rolDeCuenta(c){
+  const t = CTA[c]; if(!t) return '';
+  const n = normCab(t.nom);
+  if(t.tipo==='activo' && t.clase!=='nc'){
+    // Lo enviado a otra cuenta propia cuya cartola no se tiene ("por conciliar") no se puede
+    // verificar como efectivo: se trata aparte, por criterio conservador.
+    if(/cuentaspropias|otrascuentas/.test(n) && /porconciliar|sincartola|porrendir/.test(n)) return 'fondosPorAclarar';
+    if(/^(caja|banco|efectivo|fondofijo|cajachica)|ctacte|cuentacorriente|depositoaplazo|cuentaspropias/.test(n) && !/porrendir|socio|relacionad|cajero/.test(n)) return 'efectivo';
+    if(/^remanente/.test(n)) return 'remanente';
+    if(/^ivacredito|creditofiscal/.test(n)) return 'ivaCred';
+    if(/^ppm|pagosprovisionales/.test(n)) return 'ppm';
+    if(/^(deudor|cliente)|cuentasporcobrar|documentosporcobrar|facturasporcobrar/.test(n) && !/relacionad|socio|personal|emplead|incobrable|vario/.test(n)) return 'clientes';
+  }
+  if(t.tipo==='pasivo' && t.clase!=='nc'){
+    if(/^ivadebito|debitofiscal/.test(n)) return 'ivaDeb';
+    if(/^proveedor|cuentasporpagar|facturasporpagar|acreedorescomerciales/.test(n) && !/relacionad/.test(n)) return 'proveedores';
+    if(/remuneracion|sueldo|cotizacion|previsional|leyessociales|vacacion|finiquito/.test(n)) return 'personal';
+    if(/impuesto|retencion|f29|ppmporpagar/.test(n)) return 'impuestos';
+  }
+  return ROL_BASE[c] || '';
+}
+function rolCuenta(c){
+  if(!ROLES){ ROLES = {}; Object.keys(CTA).forEach(k=> ROLES[k] = rolDeCuenta(k)); }
+  return ROLES[c] || '';
+}
+function ctasConRol(rol){ return Object.keys(CTA).filter(c=>rolCuenta(c)===rol).sort(); }
+// Primera cuenta con esa función, prefiriendo la que tiene movimiento en el ejercicio.
+function ctaRol(rol, def){
+  const L = ctasConRol(rol); if(!L.length) return def;
+  let usadas = new Set();
+  try { asientosDelEjercicio().forEach(a=>a.lineas.forEach(l=>usadas.add(l.c))); } catch(e){}
+  return L.find(c=>usadas.has(c)) || (L.includes(def) ? def : L[0]);
 }
 reconstruirPlan();
 const TIPOS_CTA = [
@@ -513,7 +565,7 @@ const SUBS_CTA = {
   patrimonio: [{k:'capital',n:'Capital'},{k:'acumuladas',n:'Resultados acumulados'}],
   ingreso:    [{k:'ordinario',n:'De actividades ordinarias'},{k:'otros',n:'Otros ingresos'}],
   gasto:      [{k:'costo',n:'Costo de ventas'},{k:'operacional',n:'Administración y ventas'},
-               {k:'financiero',n:'Gastos financieros'},{k:'impuesto',n:'Impuesto a la renta'}]
+               {k:'financiero',n:'Gastos financieros'},{k:'otrosgastos',n:'Otros gastos no operacionales'},{k:'impuesto',n:'Impuesto a la renta'}]
 };
 function cuentaEnUso(cod){
   return S.asientos.some(a=>a.lineas.some(l=>l.c===cod)) || S.docs.some(d=>d.cuenta===cod);
@@ -530,6 +582,10 @@ const DTE = [
  {c:'56', n:'Nota de débito', a:'Nota déb.', v:1, afecta:1},
  {c:'61', n:'Nota de crédito', a:'Nota créd.', v:1, afecta:1, nc:1},
  {c:'110',n:'Factura de exportación', a:'Exportación', v:1, afecta:0},
+ {c:'111',n:'Nota de débito de exportación', a:'ND export.', v:1, afecta:0},
+ {c:'112',n:'Nota de crédito de exportación', a:'NC export.', v:1, afecta:0, nc:1},
+ {c:'43', n:'Liquidación-factura', a:'Liq.-factura', v:1, afecta:1},
+ {c:'914',n:'Declaración de ingreso (importación)', a:'DIN', v:1, afecta:1},
  {c:'BH', n:'Boleta de honorarios de terceros', a:'Honorarios', v:0, afecta:0}
 ];
 
@@ -547,6 +603,8 @@ function migrar(g){
   });
   S2.par.remoto = Object.assign({url:'',datos:null,sync:'',version:''}, (g.par&&g.par.remoto)||{});
   if(!Array.isArray(S2.banco.movs)) S2.banco.movs = [];
+  if(!Array.isArray(S2.banco.cuentas)) S2.banco.cuentas = [];
+  S2.banco.movs.forEach(m=>{ if(!m.cb) m.cb = S2.banco.cuenta; });
   if(!S2.banco.reglas) S2.banco.reglas = {};
   if(!Array.isArray(S2.plan)) S2.plan = [];
   if(!Array.isArray(S2.activos)) S2.activos = [];
@@ -558,6 +616,7 @@ function migrar(g){
   S2.folios = Object.assign({}, g.folios||{});
   if(!Array.isArray(S2.bitacora)) S2.bitacora = [];
   if(!Array.isArray(S2.centros)) S2.centros = [];
+  S2.f29Dec = Object.assign({}, g.f29Dec || {});
   if(!Array.isArray(S2.asientos)) S2.asientos = [];
   numerarExistentes(S2);
   return S2;
@@ -677,7 +736,7 @@ function balance8(lista){
 function clasificar(lista){
   const m = saldos(lista), fuera = [];
   const deu = c => m[c].debe - m[c].haber;      // saldo deudor, negativo si es acreedor
-  const G = {ordinario:0, otrosIng:0, costo:0, oper:0, fin:0, imp:0,
+  const G = {ordinario:0, otrosIng:0, costo:0, oper:0, fin:0, otrosGas:0, imp:0,
              ac:0, anc:0, pc:0, pnc:0, cap:0, uac:0, ret:0};
   Object.keys(m).forEach(c=>{
     const t = CTA[c], v = deu(c);
@@ -696,6 +755,7 @@ function clasificar(lista){
       case 'gasto':
         if(t.sub==='costo') G.costo += v;
         else if(t.sub==='financiero') G.fin += v;
+        else if(t.sub==='otrosgastos') G.otrosGas += v;
         else if(t.sub==='impuesto') G.imp += v;
         else G.oper += v;
         break;
@@ -708,9 +768,9 @@ function eri(lista){
   const {G, fuera} = clasificar(lista);
   const bruto = G.ordinario - G.costo;
   const operacional = bruto - G.oper + G.otrosIng;
-  const antesImp = operacional - G.fin;
+  const antesImp = operacional - G.fin - G.otrosGas;
   return {ingresos:G.ordinario, otrosIng:G.otrosIng, costo:G.costo, bruto,
-          oper:G.oper, operacional, fin:G.fin, antesImp, imp:G.imp,
+          oper:G.oper, operacional, fin:G.fin, otrosGas:G.otrosGas, antesImp, imp:G.imp,
           neto: antesImp - G.imp, fuera};
 }
 function esf(lista){
@@ -728,6 +788,10 @@ function addAsiento(fecha, glosa, lineas, origen, docId, tipo){
   const ls = lineas.filter(l=>l.c && (num(l.d)>0||num(l.h)>0)).map(l=>{
     const x = {c:l.c, d:R(num(l.d)), h:R(num(l.h))};
     if(l.cc && esResultado(l.c)) x.cc = l.cc;          // el centro de costo solo tiene sentido en cuentas de resultado
+    // contraparte y documento de la línea: con ellos se arma el auxiliar desde el libro
+    if(l.rut) x.rut = l.rut;
+    if(l.ent) x.ent = String(l.ent).slice(0,80);
+    if(l.dc) x.dc = String(l.dc).slice(0,40);
     return x;
   });
   if(!ls.length) return null;
@@ -740,6 +804,8 @@ function addAsiento(fecha, glosa, lineas, origen, docId, tipo){
 }
 // El folio de un comprobante borrado no se vuelve a usar: queda en la bitácora
 // como anulado, con su monto, para que el salto en la numeración se explique.
+function ctaVentaDefecto(){ const x = PLAN_ACT.find(p=>CTA[p[0]].tipo==='ingreso' && CTA[p[0]].sub!=='otros'); return x ? x[0] : '4101'; }
+function hayLibroImportado(){ return asientosDelEjercicio().some(a=>a.origen==='importado'); }
 function borrarAsiento(id){
   const a = S.asientos.find(x=>x.id===id); if(!a) return false;
   if(periodoCerrado(a.fecha)){ bloquear(a.fecha, a.glosa); return false; }
@@ -755,7 +821,12 @@ const totalAsiento = a => a.lineas.reduce((t,l)=>t+num(l.d),0);
 // tipo y folio correlativo por año: Ingreso si entra plata a caja o banco,
 // Egreso si sale, Traspaso si no la toca (o si solo se mueve entre caja y banco).
 const TIPOS_CBTE = {I:'Ingreso', E:'Egreso', T:'Traspaso'};
-function ctasDisponible(){ return new Set(['1101','1102', S.banco && S.banco.cuenta].filter(Boolean)); }
+// Cuentas corrientes de la empresa, cada una con su cuenta contable. Una sola si no se configuró nada.
+function cuentasBanco(){
+  const L = (S.banco && Array.isArray(S.banco.cuentas)) ? S.banco.cuentas.filter(b=>b && b.cuenta) : [];
+  return L.length ? L : [{cuenta: (S.banco && S.banco.cuenta) || '1102', numero:'', nombre:''}];
+}
+function ctasDisponible(){ return new Set(ctasConRol('efectivo').concat(cuentasBanco().map(b=>b.cuenta)).filter(Boolean)); }
 function tipoComprobante(lineas){
   const disp = ctasDisponible(); let entra = 0, sale = 0;
   lineas.forEach(l=>{ if(disp.has(l.c)){ entra += num(l.d); sale += num(l.h); } });
@@ -820,7 +891,8 @@ function asientoDeDoc(d){
   } else if(d.clase==='compra'){
     const prov = ctaPago || '2101';
     const sinCred = !d.creditoIva;
-    const cargo = d.neto + d.exento + (sinCred ? d.iva + d.ila : 0);
+    // el IVA no recuperable y el impuesto específico (combustibles) son costo de la compra
+    const cargo = d.neto + d.exento + num(d.ivaNR) + num(d.impEsp) + (sinCred ? d.iva + d.ila : 0);
     if(!nc){
       if(cargo) L.push({c:d.cuenta, d:cargo, cc:d.cc});
       if(!sinCred && d.iva) L.push({c:'1106', d:d.iva});
@@ -841,6 +913,11 @@ function asientoDeDoc(d){
 }
 function registrarDoc(d){
   if(periodoCerrado(d.fecha)){ bloquear(d.fecha, 'documento '+(d.folio||'')); return false; }
+  if(d.sinAsiento){
+    d.asientos = [];
+    S.docs.push(d); S.docs.sort((x,y)=> x.fecha<y.fecha?-1:1);
+    return true;
+  }
   const a = asientoDeDoc(d);
   const as = addAsiento(d.fecha, a.glosa, a.lineas, 'doc', d.id);
   d.asientos = as ? [as.id] : [];
@@ -887,14 +964,79 @@ function pagosDoc(d, hasta){
   return L.filter(p=> S.asientos.some(a=>a.id===p.aid) && (!hasta || p.fecha<=hasta));
 }
 function pendienteDoc(d, hasta){
-  if(d.condicion!=='credito') return 0;
+  if(d.condicion!=='credito' || d.sinAsiento) return 0;   // sin asiento, el cobro se sigue en el libro
   if(d.nc) return -montoDoc(d);              // la nota de crédito rebaja la deuda de esa contraparte
   return montoDoc(d) - pagosDoc(d, hasta).reduce((t,p)=>t+p.monto,0);
 }
 const TRAMOS_AUX = [[30,'0 a 30 días'],[60,'31 a 60'],[90,'61 a 90'],[180,'91 a 180'],[Infinity,'Más de 180']];
+// Auxiliar desde el libro: las líneas de Clientes o Proveedores agrupadas por el RUT
+// que trae cada una, como el análisis de cuentas por auxiliar de un sistema contable.
+// Los abonos se aplican a los cargos más antiguos (FIFO), y lo que queda abierto se
+// clasifica por antigüedad. Las líneas sin RUT (la apertura) quedan en un grupo aparte.
+function auxiliarLibro(lado, hasta){
+  const ctas = new Set(ctasConRol(lado==='cli' ? 'clientes' : 'proveedores'));
+  const propio = normRut(S.emp.rut);
+  // nombre de cada RUT, tomado de cualquier línea o documento que lo traiga
+  const nombres = {};
+  S.docs.forEach(d=>{ const r = normRut(d.rut); if(r && d.contraparte && !nombres[r]) nombres[r] = d.contraparte; });
+  asientosDelEjercicio().forEach(a=>a.lineas.forEach(l=>{ if(l.rut && l.ent && !nombres[l.rut]) nombres[l.rut] = l.ent; }));
+  const G = {};
+  asientosDelEjercicio().filter(a=>a.fecha<=hasta).forEach(a=>a.lineas.forEach(l=>{
+    if(!ctas.has(l.c)) return;
+    const cargo = lado==='cli' ? num(l.d) - num(l.h) : num(l.h) - num(l.d);    // + aumenta la deuda
+    if(!R(cargo)) return;
+    // 55.555.555-5 es el RUT genérico del SII para extranjeros: ahí manda el nombre
+    const generico = /^5{8,9}$/.test(l.rut || '');
+    let k, nombre;
+    if(a.origen==='apertura' && (!l.rut || l.rut===propio)){ k = 'apertura'; nombre = 'Saldo de apertura sin detalle por RUT'; }
+    else if(l.rut && !generico){ k = l.rut; nombre = l.ent || nombres[l.rut] || ''; }
+    else if(l.ent){ k = 'ext:' + normCab(l.ent); nombre = l.ent; }
+    else { k = 'sinrut'; nombre = lado==='cli' ? 'Movimientos sin RUT (cobros no identificados)' : 'Movimientos sin RUT (pagos no identificados)'; }
+    const g = G[k] = G[k] || {k, rut: (l.rut && !generico && k!=='apertura') ? l.rut : '', nombre: nombre || '(sin nombre)', movs:[]};
+    if(nombre && /^\(sin/.test(g.nombre)) g.nombre = nombre;
+    g.movs.push({fecha:a.fecha, monto:cargo, glosa:a.glosa, dc:l.dc||'', cbte:cbteCorto(a)});
+  }));
+  const T = {total:0, docs:0, tramos:TRAMOS_AUX.map(()=>0), sinIdentificar:0};
+  // Los abonos sin contraparte no se pueden aplicar a ninguna factura: quedan aparte,
+  // fuera de la antigüedad, y se informa cuánto son.
+  if(G.sinrut){
+    const neto = G.sinrut.movs.reduce((t,m)=>t + m.monto, 0);
+    if(neto < 0){ T.sinIdentificar = R(neto); T.total += R(neto); delete G.sinrut; }
+  }
+  const filas = Object.values(G).map(g=>{
+    const abiertos = [];
+    let favor = 0;
+    g.movs.sort((x,y)=> x.fecha<y.fecha?-1:x.fecha>y.fecha?1:0).forEach(m=>{
+      if(m.monto > 0){
+        let v = m.monto;
+        if(favor > 0){ const u = Math.min(favor, v); favor -= u; v -= u; }     // anticipo previo
+        if(v > 0) abiertos.push({fecha:m.fecha, monto:m.monto, p:v, glosa:m.glosa, dc:m.dc, cbte:m.cbte});
+      } else {
+        let v = -m.monto;
+        for(const x of abiertos){ if(v <= 0) break; const u = Math.min(x.p, v); x.p -= u; v -= u; }
+        favor += v;
+      }
+    });
+    const docs = abiertos.filter(x=>R(x.p) > 1).map(x=>({d:{dte:'', folio:x.dc || x.cbte, fecha:x.fecha, nc:false, glosa:x.glosa, libro:true, total:x.monto},
+      p:R(x.p), dias:Math.round(diasEntre(x.fecha, hasta)), pagado:R(x.monto - x.p)}));
+    if(R(favor) > 1) docs.push({d:{dte:'', folio:'saldo a favor', fecha:hasta, nc:true, glosa:'Abonos que exceden los cargos', libro:true, total:favor}, p:-R(favor), dias:0, pagado:0});
+    const fila = {k:g.k, rut:g.rut, nombre:g.nombre, docs, total:0, tramos:TRAMOS_AUX.map(()=>0), maxDias:0, libro:true};
+    docs.forEach(x=>{ const i = TRAMOS_AUX.findIndex(t=>x.dias<=t[0]); fila.total += x.p; fila.tramos[i] += x.p; if(x.p>0) fila.maxDias = Math.max(fila.maxDias, x.dias);
+      T.total += x.p; T.tramos[i] += x.p; T.docs++; });
+    return fila;
+  }).filter(f=>Math.abs(R(f.total)) > 1 || f.docs.length).sort((a,b)=>b.total-a.total);
+  const m = saldos(asientosDelEjercicio().filter(a=>a.fecha<=hasta));
+  const contable = [...ctas].reduce((t,c)=> t + (m[c] ? (lado==='cli' ? m[c].debe-m[c].haber : m[c].haber-m[c].debe) : 0), 0);
+  return {lado, hasta, cta:[...ctas].join(', '), ctas:[...ctas], filas, T, contable, dif:R(T.total - contable), modo:'libro'};
+}
 function auxiliar(lado, hasta){
   const clases = lado==='cli' ? ['venta'] : ['compra','honorario'];
-  const M = {}, T = {total:0, docs:0, tramos:TRAMOS_AUX.map(()=>0)};
+  // Si los documentos no llevan la contabilidad (vienen solo para el F29) y el libro trae
+  // el RUT en cada línea, el auxiliar se arma desde el libro.
+  const conDocs = S.docs.some(d=>clases.includes(d.clase) && !d.sinAsiento && d.condicion==='credito');
+  const ctasRol = new Set(ctasConRol(lado==='cli' ? 'clientes' : 'proveedores'));
+  if(!conDocs && asientosDelEjercicio().some(a=>a.lineas.some(l=>l.rut && ctasRol.has(l.c)))) return auxiliarLibro(lado, hasta);
+  const M = {}, T = {total:0, docs:0, tramos:TRAMOS_AUX.map(()=>0), sinIdentificar:0};
   S.docs.filter(d=>clases.includes(d.clase) && d.fecha<=hasta).forEach(d=>{
     const p = R(pendienteDoc(d, hasta));
     if(Math.abs(p) <= 1) return;
@@ -908,15 +1050,15 @@ function auxiliar(lado, hasta){
   });
   const filas = Object.values(M).sort((a,b)=>b.total-a.total);
   const m = saldos(asientosDelEjercicio().filter(a=>a.fecha<=hasta));
-  const cta = lado==='cli' ? '1103' : '2101';
-  const contable = m[cta] ? (lado==='cli' ? m[cta].debe-m[cta].haber : m[cta].haber-m[cta].debe) : 0;
-  return {lado, hasta, cta, filas, T, contable, dif: R(T.total - contable)};
+  const ctas = ctasConRol(lado==='cli' ? 'clientes' : 'proveedores');
+  const contable = ctas.reduce((t,c)=> t + (m[c] ? (lado==='cli' ? m[c].debe-m[c].haber : m[c].haber-m[c].debe) : 0), 0);
+  return {lado, hasta, cta: ctas.join(', ') || (lado==='cli' ? '1103' : '2101'), ctas, filas, T, contable, dif: R(T.total - contable)};
 }
 // Cobro o pago registrado desde el auxiliar: arma el asiento y lo amarra al documento.
 function registrarPagoDoc(d, fecha, monto, ctaDisp){
   monto = R(num(monto));
   if(monto<=0) return null;
-  const cta = d.clase==='venta' ? '1103' : '2101';
+  const cta = d.clase==='venta' ? ctaRol('clientes','1103') : ctaRol('proveedores','2101');
   const l = d.clase==='venta' ? [{c:ctaDisp, d:monto},{c:cta, h:monto}] : [{c:cta, d:monto},{c:ctaDisp, h:monto}];
   const g = (d.clase==='venta'?'Cobro ':'Pago ') + dteAbr(d.dte) + ' N° ' + (d.folio||'') + ' ' + (d.contraparte||'');
   const a = addAsiento(fecha, g.trim(), l, 'aux', d.id);
@@ -967,12 +1109,12 @@ function mesAnterior(ym){ let [y,m] = ym.split('-').map(Number); m--; if(!m){ m=
 function nomMes(ym){ return MESES[+ym.slice(5)-1] + ' ' + ym.slice(0,4); }
 // La misma forma de filas para varios períodos: así quedan alineadas, cuenta por cuenta.
 function formaEEFF(listas){
-  const f = {cods:new Set(), pnc:false, otrosIng:false, fin:false, imp:false};
+  const f = {cods:new Set(), pnc:false, otrosIng:false, fin:false, otrosGas:false, imp:false};
   listas.forEach(l=>{
     const m = saldos(l), E = esf(l), r = eri(l);
     Object.keys(m).forEach(c=>{ if(R(m[c].debe - m[c].haber)!==0) f.cods.add(c); });
     f.pnc = f.pnc || !!R(E.pnc); f.otrosIng = f.otrosIng || !!R(r.otrosIng);
-    f.fin = f.fin || !!R(r.fin); f.imp = f.imp || !!R(r.imp);
+    f.fin = f.fin || !!R(r.fin); f.imp = f.imp || !!R(r.imp); f.otrosGas = f.otrosGas || !!R(r.otrosGas);
   });
   return f;
 }
@@ -1001,18 +1143,21 @@ function variacion(a, b){ const d = a - b; return {d, p: b ? d/Math.abs(b) : nul
 // signo, exactamente lo que se movió en caja, así que el flujo cuadra solo con
 // el saldo del mayor. Los saldos de apertura no son flujo: son el saldo inicial.
 const SECC_FLUJO = [['op','Actividades de operación'],['inv','Actividades de inversión'],['fin','Actividades de financiamiento']];
-const IVA_FLUJO = ['2103','1106','2109','1110'];
+const esIvaFlujo = c => ['ivaDeb','ivaCred','ilaDeb','ilaCred'].includes(rolCuenta(c));
 function categoriaFlujo(c){
   const t = CTA[c];
   if(!t) return ['op','Otros movimientos de operación'];
   if((t.tipo==='activo'||t.tipo==='activoC') && t.clase==='nc') return ['inv','Compra y venta de activo fijo'];
+  // fondos que salen a una cuenta propia sin cartola: no son equivalentes al efectivo verificables
+  if(rolCuenta(c)==='fondosPorAclarar') return ['inv','Fondos enviados a otra cuenta propia (sin cartola)'];
   if(t.tipo==='pasivo' && t.clase==='nc') return ['fin','Préstamos de largo plazo'];
   if(t.tipo==='patrimonio') return ['fin','Aportes de capital'];
   if(t.tipo==='patrimonioD') return ['fin','Retiros de los dueños'];
-  if(['2104','2106','2107','5102','5111','5113'].includes(c)) return ['op','Pagos al personal'];
-  if(['2103','2105','2109','2110','1106','1108','1110'].includes(c) || t.sub==='impuesto') return ['op','Impuestos (IVA, PPM, retenciones, renta)'];
+  const rol = rolCuenta(c), n = normCab(t.nom);
+  if(rol==='personal' || ['5102','5111','5113'].includes(c) || (t.tipo==='gasto' && /remuneracion|sueldo|leyessociales|indemnizacion/.test(n))) return ['op','Pagos al personal'];
+  if(['ivaDeb','ivaCred','remanente','ilaDeb','ilaCred','ppm','impuestos'].includes(rol) || t.sub==='impuesto') return ['op','Impuestos (IVA, PPM, retenciones, renta)'];
   if(t.sub==='financiero') return ['op','Intereses pagados'];
-  if(t.tipo==='ingreso' || ['1103','1104','1109','2108'].includes(c)) return ['op','Cobros a clientes'];
+  if(t.tipo==='ingreso' || rol==='clientes' || ['1109','2108'].includes(c)) return ['op','Cobros a clientes'];
   return ['op','Pagos a proveedores y gastos'];
 }
 function flujoCaja(C){
@@ -1027,11 +1172,11 @@ function flujoCaja(C){
     const m = +a.fecha.slice(5,7) - 1;
     // El IVA que viene dentro de una venta o compra al contado va con ella, igual
     // que cuando se cobra o paga una factura a crédito: el cobro incluye el IVA.
-    const otras = a.lineas.filter(l=>!disp.has(l.c) && !IVA_FLUJO.includes(l.c));
+    const otras = a.lineas.filter(l=>!disp.has(l.c) && !esIvaFlujo(l.c));
     const principal = otras.length ? otras.reduce((x, l)=> num(l.d)+num(l.h) > num(x.d)+num(x.h) ? l : x) : null;
     a.lineas.forEach(l=>{
       if(disp.has(l.c)) return;
-      const cat = IVA_FLUJO.includes(l.c) && principal ? principal.c : l.c;
+      const cat = esIvaFlujo(l.c) && principal ? principal.c : l.c;
       const [k, nom] = categoriaFlujo(cat), v = num(l.h) - num(l.d);
       const L = S0[k].lineas[nom] = S0[k].lineas[nom] || cero();
       L[m] += v; S0[k].tot[m] += v;
@@ -1055,14 +1200,16 @@ function posicionCaja(C, FC){
     {n:'Caja y banco al ' + C.hasta, v:FC.fin[FC.n-1]},
     {n:'Más: por cobrar a clientes (auxiliar)', v:cli.T.total},
     {n:'Menos: por pagar a proveedores (auxiliar)', v:-pro.T.total},
-    {n:'Menos: sueldos y cotizaciones por pagar', v:-(acr('2104') + acr('2106'))},
+    {n:'Menos: sueldos y cotizaciones por pagar', v:-ctasConRol('personal').reduce((t,c)=>t + acr(c), 0)},
     {n:'Menos: F29 de ' + MESES[C.mesIdx] + ' (vence el mes siguiente)', v:-(f ? f.total : 0)}
   ];
   return {filas, neto: filas.reduce((t,x)=>t + x.v, 0)};
 }
 
 /* ---------------------- 7. circuito tributario: F29 ------------------- */
-function docsMes(ym){ return S.docs.filter(d=>ymOf(d.fecha)===ym); }
+// Documentos del período tributario: el del registro de compras y ventas si viene, si no el de su fecha.
+const periodoDoc = d => d.periodo || ymOf(d.fecha);
+function docsMes(ym){ return S.docs.filter(d=>periodoDoc(d)===ym); }
 
 function f29Mes(ym, remanenteAnt){
   const L = docsMes(ym);
@@ -1080,10 +1227,15 @@ function f29Mes(ym, remanenteAnt){
       comprasNeto += s*(d.neto+d.exento);
       if(d.creditoIva){ cred += s*d.iva; ilaC += s*d.ila; if(d.nc) credNC += d.iva; }
       else sinCredito += s*(d.neto+d.exento+d.iva);
+      sinCredito += s*(num(d.ivaNR) + num(d.impEsp));
     } else { ret += d.retencion; honBruto += d.neto; }
   });
   const debito = debFact + debBol;
-  const credTotal = cred + num(remanenteAnt);
+  // El remanente del mes anterior se reajusta por la variación de la UTM entre
+  // el mes en que se presentó esa declaración y el de esta (art. 27 del DL 825).
+  const fr = factorRemanente(ym);
+  const remReaj = R(num(remanenteAnt) * fr.f);
+  const credTotal = cred + remReaj;
   const ivaDet = debito - credTotal;
   const aPagarIVA = Math.max(ivaDet, 0);
   const remanenteSig = Math.max(-ivaDet, 0);
@@ -1095,10 +1247,18 @@ function f29Mes(ym, remanenteAnt){
   const basePPM = netoAfecto + netoExento;
   const ppm = tPPM==null ? 0 : R(basePPM * tPPM);
 
-  return {ym, debFact, debBol, debNC, debito, cred, credNC, remanenteAnt:num(remanenteAnt), credTotal,
+  return {ym, debFact, debBol, debNC, debito, cred, credNC, remanenteAnt:num(remanenteAnt), remReaj, factorRem:fr.f, sinUTM:fr.falta, credTotal,
           ivaDet, aPagarIVA, remanenteSig, ilaD, ilaC, ilaNeto, ret, honBruto,
           netoAfecto, netoExento, exentas, comprasNeto, sinCredito, basePPM, tPPM, ppm,
           total: aPagarIVA + Math.max(ilaNeto,0) + ppm + ret, docs:L.length};
+}
+// UTM de cada mes: la trae sincronizar() desde mindicador.cl, o se carga a mano.
+function utmDe(ym){ const t = (S.par && S.par.utmMes) || {}; return num(t[ym]) || null; }
+function mesSiguiente(ym){ let [y,m] = ym.split('-').map(Number); m++; if(m>12){ m=1; y++; } return y+'-'+String(m).padStart(2,'0'); }
+function factorRemanente(ym){
+  const a = utmDe(ym), b = utmDe(mesSiguiente(ym));
+  // la variación se aplica como porcentaje con un decimal (−0,2 %, +1,0 %…)
+  return a && b ? {f: 1 + Math.round((b / a - 1) * 1000) / 1000, falta:false} : {f:1, falta:true};
 }
 function f29Ano(){
   const out=[]; let rem = num(S.par.remanenteInicial);
@@ -2434,12 +2594,17 @@ const COLS = {
   iva:    ['montoivarecuperable','montoiva','iva'],
   ivaNR:  ['montoivanorecuperable','ivanorecuperable'],
   ivaUC:  ['montoivausocomun','ivausocomun'],
-  otros:  ['valorotroimpuesto','montootroimpuesto','otroimpuesto','impuestoadicional'],
+  codOtro:['codigootroimpuesto','codigootroimp','codotroimpuesto'],
+  otros:  ['valorotroimpuesto','montootroimpuesto','valorotroimp','otroimpuesto','impuestoadicional'],
   total:  ['montototal','total']
 };
 // Columnas que nunca deben capturarse: distorsionan los totales si se confunden.
 const PROHIBIDAS = ['montonetoactivofijo','montoivaactivofijo','tasaotroimpuesto',
-                    'codigootroimpuesto','codigoivanorecuperable','montoivaretenidototal'];
+                    'codigoivanorecuperable','montoivaretenidototal'];
+// Códigos del SII para "otro impuesto" que son impuestos adicionales del DL 825
+// (dan crédito). Los demás, como el impuesto específico a los combustibles
+// (28 diésel, 35 gasolinas), no dan crédito de IVA: son parte del costo.
+const COD_ILA = ['23','24','25','26','27','271','44','45','46'];
 
 function mapearColumnas(cab){
   const N = cab.map(normCab);
@@ -2504,8 +2669,8 @@ function analizarImport(txt, claseForzada, anoDefecto, filasPre){
 
   const g = (f,k)=> mapa[k]===undefined ? '' : (f[mapa[k]]||'');
   const filas2 = filas.slice(ini+1), docs = [], problemas = [];
-  const yaEstan = new Set(S.docs.map(d=>d.clase+'|'+d.dte+'|'+d.folio+'|'+(d.rut||'')));
-  let repetidos = 0;
+  const yaEstan = new Set(S.docs.map(d=>(d.liqFactura?'compra':d.clase)+'|'+d.dte+'|'+d.folio+'|'+(d.rut||'')));
+  let repetidos = 0, enCero = 0;
 
   filas2.forEach((f, i)=>{
     const tipo = String(g(f,'tipo')).trim().replace(/\D/g,'') || '33';
@@ -2518,16 +2683,24 @@ function analizarImport(txt, claseForzada, anoDefecto, filasPre){
     const ivaNR = numCSV(g(f,'ivaNR'));
     let otros = numCSV(g(f,'otros'));
     let total = numCSV(g(f,'total'));
+    const codOtro = String(g(f,'codOtro')).trim().replace(/\D/g,'');
 
-    // Una nota de crédito viene con tipo 61, o con los montos en negativo.
+    // Una nota de crédito viene con tipo 61 (o 112 si es de exportación), o con los montos en negativo.
     const negativo = (total||neto) < 0;
-    const nc = tipo==='61' || negativo;
+    const nc = tipo==='61' || tipo==='112' || negativo;
     if(negativo){ neto=Math.abs(neto); exento=Math.abs(exento); iva=Math.abs(iva);
                   otros=Math.abs(otros); total=Math.abs(total); }
 
     if(!total) total = neto + exento + iva + ivaNR + otros;
     if(!neto && !exento && total) { neto = R(total/(1+IVA)); iva = total - neto; }
-    if(total<=0){ problemas.push('fila '+(i+2)+': sin monto'); return; }
+    // Documentos en cero (el SII lista, por ejemplo, avisos de bancos): no tienen efecto tributario
+    if(total<=0){ enCero++; return; }
+    // En compras, el "otro impuesto" es crédito solo si es un impuesto adicional del DL 825
+    let ila = otros, impEsp = 0;
+    if(clase==='compra' && otros && !(codOtro ? COD_ILA.includes(codOtro) : true)){ impEsp = otros; ila = 0; }
+    // La liquidación-factura que llega al registro de compras es una venta hecha por un
+    // mandatario a nombre de la empresa: su IVA es débito, no crédito (así se declara en el F29).
+    const liqFactura = clase==='compra' && tipo==='43';
 
     const llave = clase+'|'+tipo+'|'+folio+'|'+rut;
     if(yaEstan.has(llave)){ repetidos++; return; }
@@ -2535,21 +2708,43 @@ function analizarImport(txt, claseForzada, anoDefecto, filasPre){
 
     docs.push({fila:i+ini+2, fecha, dte:tipo, folio, rut,
       contraparte: String(g(f,'nombre')).trim(),
-      neto:R(neto), exento:R(exento), iva:R(iva), ila:R(otros), ivaNR:R(ivaNR),
-      total:R(total), nc, clase});
+      neto:R(neto), exento:R(exento), iva:R(iva), ila:R(ila), impEsp:R(impEsp), codOtro, ivaNR:R(ivaNR),
+      total:R(total), nc, clase: liqFactura ? 'venta' : clase, liqFactura});
   });
-  return {delim, cab, mapa, clase, docs, problemas, repetidos, leidas:filas2.length};
+  // Período tributario del registro: el RCV se descarga por mes y puede traer documentos
+  // con fecha de un mes anterior (registrados tarde). El F29 los toma en el período del
+  // registro, no en el de su fecha. Se toma el mes que domina en el archivo.
+  const porMes = {};
+  docs.forEach(d=>{ const k = ymOf(d.fecha); porMes[k] = (porMes[k]||0) + 1; });
+  const dominante = Object.keys(porMes).sort((a,b)=>porMes[b]-porMes[a])[0];
+  const periodo = (filasPre && filasPre.periodo) || (dominante && porMes[dominante] >= docs.length*0.6 ? dominante : '');
+  if(periodo){
+    docs.forEach(d=>{ d.periodo = periodo; });
+    const fuera = docs.filter(d=>ymOf(d.fecha)!==periodo).length;
+    if(fuera) problemas.push(fuera + ' documento(s) con fecha de otro mes van al período ' + periodo + ' del registro, como en el F29');
+  }
+  if(enCero) problemas.push(enCero + ' documento(s) en $0 se omiten: no tienen efecto tributario');
+  const liq = docs.filter(d=>d.liqFactura).length;
+  if(liq) problemas.push(liq + ' liquidación(es)-factura recibida(s): se cargan como venta hecha por el mandatario, con IVA débito');
+  const esp = docs.filter(d=>d.impEsp).length;
+  if(esp) problemas.push(esp + ' documento(s) con impuesto específico (combustibles u otro sin derecho a crédito): va al costo');
+  return {delim, cab, mapa, clase, docs, problemas, repetidos, enCero, periodo, leidas:filas2.length};
 }
 
-function confirmarImport(an, cuenta, creditoIva){
+// sinAsiento: la contabilidad ya viene de un libro diario importado, así que los
+// documentos entran solo al circuito tributario (F29). Si además generaran su
+// asiento, cada venta y cada compra quedaría dos veces en los estados.
+function confirmarImport(an, cuenta, creditoIva, sinAsiento){
   let n = 0;
   an.docs.forEach(d=>{
-    const doc = {id:uid(), fecha:d.fecha, clase:an.clase, dte:d.dte, folio:d.folio,
+    const clase = d.clase || an.clase;
+    const doc = {id:uid(), fecha:d.fecha, clase, dte:d.dte, folio:d.folio,
       contraparte:d.contraparte, rut:d.rut,
       neto:d.neto, exento:d.exento, iva:d.iva, ila:d.ila, retencion:0, total:d.total,
-      ilaTasa:0, condicion:'credito', cuenta:cuenta,
-      creditoIva: an.clase==='compra' ? (creditoIva && d.iva>0) : false,
-      costo:0, nc:d.nc, importado:true};
+      ilaTasa:0, condicion:'credito', cuenta: clase!==an.clase ? ctaVentaDefecto() : cuenta,
+      creditoIva: clase==='compra' ? (creditoIva && d.iva>0) : false,
+      costo:0, nc:d.nc, importado:true, sinAsiento: !!sinAsiento,
+      impEsp:d.impEsp||0, ivaNR:d.ivaNR||0, liqFactura: !!d.liqFactura, periodo: d.periodo || ''};
     if(registrarDoc(doc)) n++;
   });
   return n;
@@ -2605,10 +2800,59 @@ function validarMapaBanco(filas, ini, mapa){
   else if(nm === 0 && nc + na > 0) delete m.monto;
   return m;
 }
+// Número de la cuenta corriente que trae el encabezado de la cartola
+// ("Cuenta Corriente N°: 0-000-8546749-2", "Numero Cuenta | 989473395").
+function numeroCuentaCartola(filas){
+  for(const f of filas.slice(0, 25)){
+    const t = (f||[]).map(x=>String(x)).join(' | ');
+    const m = t.match(/cuenta\s*(?:corriente|vista|cte\.?)?\s*(?:n[°ºo]\.?|n[uú]mero|nro\.?)?\s*:?\s*\|?\s*(\d[\d.\- ]{5,}\d)/i)
+           || t.match(/(?:n[uú]mero|nro\.?|n[°º])\s*(?:de\s*)?cuenta\s*:?\s*\|?\s*(\d[\d.\- ]{5,}\d)/i);
+    if(m) return m[1].replace(/\D/g,'');
+  }
+  return '';
+}
+// Cuenta contable que corresponde a ese número: la ya configurada, o la del plan
+// cuyo nombre trae el número ("Banco de Chile Cta. Cte. 0-000-8546749-2").
+function cuentaDeNumero(numero){
+  const k = String(numero||'').replace(/^0+/,'');
+  if(k.length < 5) return '';
+  const b = ((S.banco && S.banco.cuentas)||[]).find(x=>String(x.numero||'').replace(/^0+/,'')===k);
+  if(b) return b.cuenta;
+  const c = Object.keys(CTA).find(c=> CTA[c].tipo==='activo' && CTA[c].nom.replace(/\D/g,'').replace(/^0+/,'').indexOf(k) >= 0);
+  return c || '';
+}
+function movsBanco(cta){
+  cta = cta || S.banco.cuenta;
+  return (S.banco.movs||[]).filter(m=>(m.cb || S.banco.cuenta)===cta);
+}
+// Incorpora los movimientos de una cartola a su cuenta; deja esa cuenta como la activa.
+function agregarMovsBanco(an){
+  const cta = an.cuentaDetectada || S.banco.cuenta;
+  S.banco.cuentas = Array.isArray(S.banco.cuentas) ? S.banco.cuentas : [];
+  if(!S.banco.cuentas.some(b=>b.cuenta===cta))
+    S.banco.cuentas.push({cuenta:cta, numero:an.numeroCuenta||'', nombre:nomCta(cta)});
+  else if(an.numeroCuenta){ const b = S.banco.cuentas.find(x=>x.cuenta===cta); if(!b.numero) b.numero = an.numeroCuenta; }
+  an.movs.forEach(m=>{ m.cb = cta; });
+  // Hay cartolas (Banco de Chile, por ejemplo) que traen el saldo solo en el encabezado:
+  // con el saldo inicial se reconstruye el saldo después de cada movimiento.
+  const ini = an.control && an.control.inicial;
+  if(ini !== null && ini !== undefined && isFinite(ini) && an.movs.length && an.movs.every(m=>m.saldo===null || m.saldo===undefined)){
+    let s = num(ini);
+    an.movs.slice().sort((a,b)=> a.fecha<b.fecha?-1:a.fecha>b.fecha?1:0).forEach(m=>{ s += num(m.monto); m.saldo = R(s); });
+  }
+  if(ini !== null && ini !== undefined && isFinite(ini) && an.movs.length){
+    const b = S.banco.cuentas.find(x=>x.cuenta===cta), f0 = an.movs.reduce((m,x)=> x.fecha<m ? x.fecha : m, an.movs[0].fecha);
+    if(!b.fechaIni || f0 < b.fechaIni){ b.fechaIni = f0; b.saldoIni = num(ini); }
+  }
+  S.banco.movs = (S.banco.movs||[]).concat(an.movs).sort((a,b)=> a.fecha<b.fecha?-1:a.fecha>b.fecha?1:0);
+  S.banco.cuenta = cta;
+  return an.movs.length;
+}
 function analizarCartola(txt, anoDefecto, filasPre, override){
   const delim = filasPre ? null : detectarDelim(txt);
   const filas = filasPre || parseCSV(txt, delim);
   if(filas.length < 2) return {error:'El archivo no tiene filas suficientes.', filas};
+  const numeroCuenta = numeroCuentaCartola(filas), cuentaDetectada = cuentaDeNumero(numeroCuenta);
 
   let ini, mapa;
   if(override && override.mapa){
@@ -2648,7 +2892,7 @@ function analizarCartola(txt, anoDefecto, filasPre, override){
   // no se descartan por repetidos dentro del archivo; solo se omiten los que ya
   // estaban cargados, y contando cuántas veces estaba cada uno.
   const yaCargados = {};
-  (S.banco.movs||[]).forEach(m=>{
+  movsBanco(cuentaDetectada || S.banco.cuenta).forEach(m=>{
     const k = m.fecha+'|'+m.monto+'|'+normCab(m.glosa).slice(0,24);
     yaCargados[k] = (yaCargados[k]||0) + 1;
   });
@@ -2761,14 +3005,15 @@ function analizarCartola(txt, anoDefecto, filasPre, override){
   if(!movs.length && !repetidos)
     return {error:'Encontré los títulos pero ninguna fila con fecha y monto debajo. Revisa el mapeo manual.',
             filas, cab, mapa, ini, necesitaMapa:true};
-  return {delim, cab, mapa, ini, filas, movs, problemas, repetidos, control, leidas:filas.length-ini-1};
+  return {delim, cab, mapa, ini, filas, movs, problemas, repetidos, control, leidas:filas.length-ini-1, numeroCuenta, cuentaDetectada};
 }
 
 // Movimientos de la cuenta banco en el libro diario.
+// Movimientos de la cuenta banco en el libro, sin la apertura: el saldo inicial no es un movimiento de la cartola.
 function movimientosLibro(){
   const out = [];
   asientosDelEjercicio().forEach(a=> a.lineas.forEach(l=>{
-    if(l.c !== S.banco.cuenta) return;
+    if(l.c !== S.banco.cuenta || a.origen==='apertura') return;
     out.push({aid:a.id, n:cbteCorto(a), fecha:a.fecha, glosa:a.glosa, monto: num(l.d) - num(l.h)});
   }));
   return out.sort((a,b)=> a.fecha<b.fecha?-1:1);
@@ -2782,7 +3027,7 @@ function docsPendientes(){
 }
 
 function emparejar(){
-  const movs = (S.banco.movs||[]).slice();
+  const movs = movsBanco().slice();
   const lib = movimientosLibro();
   const usadosLib = new Set(movs.filter(m=>m.aid).map(m=>m.aid));
   const pares = [], soloBanco = [];
@@ -2863,24 +3108,27 @@ function asientoDesdeMovBanco(m, cuenta){
 function asientoDesdeDocBanco(m, d){
   const t = Math.abs(m.monto);
   const l = d.clase==='venta'
-    ? [{c:S.banco.cuenta, d:t}, {c:'1103', h:t}]
-    : [{c:'2101', d:t}, {c:S.banco.cuenta, h:t}];
+    ? [{c:S.banco.cuenta, d:t}, {c:ctaRol('clientes','1103'), h:t}]
+    : [{c:ctaRol('proveedores','2101'), d:t}, {c:S.banco.cuenta, h:t}];
   const g = (d.clase==='venta'?'Cobro ':'Pago ') + dteAbr(d.dte) + ' N° ' + (d.folio||'') + ' ' + (d.contraparte||'');
   return {g:g.trim(), l};
 }
 
 function informeConciliacion(hasta){
   const E = emparejar();
-  const corte = hasta || (S.banco.movs.length ? S.banco.movs[S.banco.movs.length-1].fecha : hoyISO());
+  const MB = movsBanco();
+  const corte = hasta || (MB.length ? MB[MB.length-1].fecha : hoyISO());
   const dentro = x => x.fecha <= corte;
 
   // Saldo según la cartola: el último saldo informado, o la suma de movimientos
   // más el saldo inicial que haya cargado el usuario.
-  const conSaldo = S.banco.movs.filter(m=>dentro(m) && m.saldo!==null);
+  const conSaldo = MB.filter(m=>dentro(m) && m.saldo!==null && m.saldo!==undefined);
+  const cb = cuentasBanco().find(b=>b.cuenta===S.banco.cuenta) || {};
   const saldoCartola = conSaldo.length ? conSaldo[conSaldo.length-1].saldo
-    : num(S.banco.saldoInicial) + S.banco.movs.filter(dentro).reduce((a,m)=>a+m.monto,0);
+    : num(cb.saldoIni !== undefined ? cb.saldoIni : S.banco.saldoInicial) + MB.filter(dentro).reduce((a,m)=>a+m.monto,0);
 
-  const saldoLibro = movimientosLibro().filter(dentro).reduce((a,l)=>a+l.monto,0);
+  // saldo contable: apertura más movimientos hasta el corte
+  const saldoLibro = asientosDelEjercicio().filter(dentro).reduce((t,a)=>t + a.lineas.reduce((u,l)=> l.c===S.banco.cuenta ? u + num(l.d) - num(l.h) : u, 0), 0);
 
   const depTransito = E.soloLibro.filter(l=>dentro(l) && l.monto>0).reduce((a,l)=>a+l.monto,0);
   const chequesNo  = E.soloLibro.filter(l=>dentro(l) && l.monto<0).reduce((a,l)=>a-l.monto,0);
@@ -2911,7 +3159,15 @@ const COLS_LIB = {
   debe:   ['debe','debito','debitos','cargo','cargos','deudor'],
   haber:  ['haber','credito','creditos','abono','abonos','acreedor'],
   monto:  ['monto','importe','valor','saldo'],
-  cc:     ['centrodecosto','centrodecostos','centrocosto','centrocostos','ccosto','cc']
+  cc:     ['centrodecosto','centrodecostos','centrocosto','centrocostos','ccosto','cc'],
+  // contraparte de la línea (análisis por RUT, como el auxiliar de un sistema contable)
+  rut:    ['rutauxiliar','rutcontraparte','rutcliente','rutproveedor','rut'],
+  ent:    ['razonsocial','nombreauxiliar','contraparte','auxiliar'],
+  // clasificación que trae el propio plan del cliente
+  clase:  ['clasecuenta','clase','tipocuenta','naturaleza'],
+  rubro:  ['rubro','agrupacion','grupo','clasificacion'],
+  origen: ['origen','tipoasiento','tipodeasiento'],
+  docu:   ['documento','numerodocumento','ndocumento','folio','nrodocumento']
 };
 
 // El orden importa: primero lo que se reconoce por cómo empieza el nombre,
@@ -3104,6 +3360,35 @@ function partirCuenta(t){
 // El plan del cliente manda. Si su cuenta trae código propio, se crea con ese
 // código y ese nombre: fundirla en una cuenta parecida del plan base le
 // desarma su estructura y después nada le calza con sus informes anteriores.
+// La clase y el rubro que trae el plan del cliente mandan sobre lo que se deduce
+// del nombre: "ACTIVO / Activo no corriente", "RESULTADO / Costos", etc.
+function tipoDesdeClase(clase, rubro, nom, cod){
+  const c = normCab(clase), r = normCab(rubro), n = normCab(nom);
+  if(!c && !r) return null;
+  const nc = /nocorriente|largoplazo|fijo/.test(r);
+  if(/activo/.test(c) || /^activo/.test(r)){
+    const comp = /depreciacionacumulada|amortizacionacumulada|deterioro|estimacion|provisionincobrable/.test(n);
+    return {tipo: comp ? 'activoC' : 'activo', clase: nc ? 'nc' : 'c', sub:''};
+  }
+  if(/pasivo/.test(c) || /^pasivo/.test(r)) return {tipo:'pasivo', clase: nc ? 'nc' : 'c', sub:''};
+  if(/patrimonio|capital/.test(c) || /patrimonio/.test(r)){
+    if(/retiro/.test(n)) return {tipo:'patrimonioD', clase:'', sub:''};
+    return {tipo:'patrimonio', clase:'', sub: /acumulad|retenid|ejerciciosanteriores/.test(n) ? 'acumuladas' : ''};
+  }
+  // cuentas de resultado: el rubro dice si es ingreso, costo, gasto o no operacional
+  const ingreso = /ingreso|venta|ganancia/.test(r + c) && !/costo|gasto|perdida/.test(r);
+  const esIng = ingreso || (/resultado/.test(c) && !r && String(cod).charAt(0) === '4');
+  if(esIng) return {tipo:'ingreso', clase:'', sub: /otros|nooperacional|financier/.test(r) ? 'otros' : ''};
+  if(/resultado|gasto|costo|perdida/.test(c + r)){
+    let sub = 'operacional';
+    if(/costo/.test(r)) sub = 'costo';
+    else if(/financier|interes|comisionesbancarias/.test(n)) sub = 'financiero';
+    else if(/impuestoalarenta|impuestoprimeracategoria/.test(n)) sub = 'impuesto';
+    else if(/nooperacional|otrosgastos/.test(r)) sub = 'otrosgastos';
+    return {tipo:'gasto', clase:'', sub};
+  }
+  return null;
+}
 function resolverCuenta(cod, nom){
   const c = String(cod||'').replace(/\D/g,'');
   if(c && CTA[c]) return {cod:c, nueva:false, via:'codigo'};
@@ -3123,6 +3408,7 @@ function revisarCuentasNuevas(nuevas, votos){
   const av = [];
   const vistos = {};
   nuevas.forEach(x=>{
+    if(x.claseTxt || x.rubroTxt) return;            // la clasificación la trajo el propio plan del cliente
     const pn = inferirPorNombre(x.nom);
     const fam = votos ? familiaAprendida(votos, x.cod) : null;
 
@@ -3212,6 +3498,9 @@ function detectarModoLibro(filas, mapa, ini){
 function separarEmpresas(cab, cuerpo, pedida){
   const ce = cab.findIndex(h => /^(empresa|empresas|sociedad|razonsocial|compania|entidad|filial|unidaddenegocio)$/.test(normCab(h)));
   if(ce < 0) return null;
+  // "Razón social" al lado de un RUT es la contraparte de cada línea (cliente o
+  // proveedor), no la empresa dueña del libro: tomarla así dejaba fuera casi todo.
+  if(normCab(cab[ce]) === 'razonsocial' && cab.some((h, i)=> i !== ce && /^rut/.test(normCab(h)))) return null;
   let cur = '';
   const etiqueta = cuerpo.map(f=>{
     const v = String((f||[])[ce] || '').trim();
@@ -3220,7 +3509,8 @@ function separarEmpresas(cab, cuerpo, pedida){
     return cur || null;
   });
   const nombres = [...new Set(etiqueta.filter(Boolean))];
-  if(nombres.length < 2) return null;
+  // un archivo consolidado trae pocas empresas; decenas de nombres distintos son contrapartes
+  if(nombres.length < 2 || nombres.length > 12) return null;
   const clave = n => normCab(n).replace(/(spa|sa|ltda|limitada|sociedadanonima|eirl)$/, '');
   const propia = normCab((typeof S !== 'undefined' && S.emp && S.emp.nombre) || '');
   const coincide = (pedida && nombres.find(n => normCab(n) === normCab(pedida)))
@@ -3295,7 +3585,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
   }
 
   const lineas = [], problemas = [];
-  let ultFecha = '', ultNum = '', ultGlosa = '';
+  let ultFecha = '', ultNum = '', ultGlosa = '', ultOrigen = '';
 
   cuerpo.forEach((f,i)=>{
     // Muchos libros repiten fecha, número y glosa solo en la primera línea del
@@ -3304,6 +3594,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
     if(fr){ const fx = fechaISO(fr, null); if(/^\d{4}-\d{2}-\d{2}$/.test(fx)) ultFecha = fx; }
     const nr = String(g(f,'num')).trim(); if(nr) ultNum = nr;
     const gl = String(g(f,'glosa')).trim(); if(gl) ultGlosa = gl;
+    const og = String(g(f,'origen')).trim(); if(og || nr) ultOrigen = og;
 
     let cod = String(g(f,'codigo')).trim();
     let nom = String(g(f,'nombre')).trim() || nombreJunto[i] || '';
@@ -3324,9 +3615,10 @@ function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
     if(/^(total|suma|sumas)/i.test((cod + ' ' + nom).trim()) || /^(totales?|sumas?|suma total)\b/i.test(nom.trim())) return;
 
     const rc = resolverCuenta(cod, nom);
-    lineas.push({fila:filaArchivo[i], fecha:ultFecha, num:ultNum, glosa:ultGlosa || 'Asiento importado',
+    lineas.push({fila:filaArchivo[i], fecha:ultFecha, num:ultNum, glosa:ultGlosa || 'Asiento importado', origen:ultOrigen,
                  cod: rc.cod, nom, nueva: rc.nueva, via: rc.via, codArchivo: cod,
-                 debe:R(debe), haber:R(haber), cc:String(g(f,'cc')||'').trim()});
+                 debe:R(debe), haber:R(haber), cc:String(g(f,'cc')||'').trim(),
+                 rut:normRut(g(f,'rut')), ent:String(g(f,'ent')||'').trim(), dc:String(g(f,'docu')||'').trim()});
   });
 
   const modoDetectado = detectarModoLibro(filas.slice(0, ini+1).concat(cuerpo), mapa, ini);
@@ -3347,11 +3639,12 @@ function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
       const k = c || normCab(nom);
       if(!k || todas[k]) return;
       if(c && CTA[c] && normCab(CTA[c].nom) === normCab(nom)) return;   // ya está igual
-      todas[k] = {cod:c, nom: nom || ('Cuenta ' + c), lineas:0, ya: !!(c && CTA[c])};
+      todas[k] = {cod:c, nom: nom || ('Cuenta ' + c), lineas:0, ya: !!(c && CTA[c]),
+                  claseTxt:String(g(f,'clase')).trim(), rubroTxt:String(g(f,'rubro')).trim()};
     });
     const lista = Object.values(todas).filter(x=>x.cod);
     const votos = aprenderConvencion(lista);
-    lista.forEach(x=> Object.assign(x, inferirCuenta(x.cod, x.nom, votos)));
+    lista.forEach(x=> Object.assign(x, inferirCuenta(x.cod, x.nom, votos), tipoDesdeClase(x.claseTxt, x.rubroTxt, x.nom, x.cod) || {}));
     return {cab, mapa, modo, modoDetectado, empresas, empresa, empresaCoincide, paginasImagen: filas.paginasImagen || null, lineas:[], nuevas:lista, asociadas:[], problemas,
             avisos: revisarCuentasNuevas(lista, votos), debe:0, haber:0, dif:0,
             asientos:[], leidas:cuerpo.length};
@@ -3430,7 +3723,7 @@ function analizarLibro(txt, modo, anoDefecto, filasPre, opciones){
   asientos.forEach(gr=>{
     const d = gr.reduce((a,l)=>a+l.debe,0), h = gr.reduce((a,l)=>a+l.haber,0);
     const item = {lineas:gr, debe:d, haber:h, dif:R(d)-R(h),
-                  fecha: gr[0].fecha || (anoDefecto+'-01-01'), glosa: gr[0].glosa, num: gr[0].num};
+                  fecha: gr[0].fecha || (anoDefecto+'-01-01'), glosa: gr[0].glosa, num: gr[0].num, origen: gr[0].origen || ''};
     if(Math.abs(item.dif) <= 1) ok.push(item); else malos.push(item);
   });
 
@@ -3460,9 +3753,11 @@ function confirmarLibro(an, fechaSaldos){
   }
   let n = 0;
   an.asientos.forEach(gr=>{
-    const l = gr.lineas.map(x=>({c:x.cod, d:x.debe, h:x.haber, cc:centroDesdeTexto(x.cc)}));
+    const l = gr.lineas.map(x=>({c:x.cod, d:x.debe, h:x.haber, cc:centroDesdeTexto(x.cc), rut:x.rut, ent:x.ent, dc:x.dc}));
     const glosa = (gr.num ? 'N° '+gr.num+' ' : '') + gr.glosa;
-    if(addAsiento(gr.fecha, glosa.slice(0,120), l, 'importado')) n++;
+    // El asiento de apertura del libro no es un movimiento del ejercicio: es el saldo inicial
+    const apertura = /apertura|saldos?\s*inicial/i.test(gr.origen || '') || /^(asiento\s+de\s+)?apertura|saldos?\s+(de\s+)?apertura|saldos?\s+iniciales/i.test(gr.glosa || '');
+    if(addAsiento(gr.fecha, glosa.slice(0,120), l, apertura ? 'apertura' : 'importado', null, apertura ? 'T' : undefined)) n++;
   });
   return n;
 }
@@ -3902,21 +4197,29 @@ function asientosCM(C){
 /* ---------------------- 9. cuadratura --------------------------------- */
 function cuadratura(){
   const ym = ymActual(), lista = asientosHasta(ym);
-  // movimiento neto de una cuenta, pudiendo filtrar por origen del asiento
-  function movCta(cod, filtro){
+  // movimiento neto de las cuentas de una función (o de un código), pudiendo filtrar asientos
+  function movCta(rolOcod, filtro){
+    const ctas = new Set(ROL_BASE[rolOcod] || CTA[rolOcod] ? [rolOcod].concat(ctasConRol(ROL_BASE[rolOcod]||'__')) : ctasConRol(rolOcod));
     let d=0,h=0;
     lista.forEach(a=>{ if(filtro && !filtro(a)) return;
-      a.lineas.forEach(l=>{ if(l.c===cod){ d+=num(l.d); h+=num(l.h); } }); });
+      a.lineas.forEach(l=>{ if(ctas.has(l.c)){ d+=num(l.d); h+=num(l.h); } }); });
     return {d, h, deudor:d-h, acreedor:h-d};
   }
-  const noF29 = a => a.origen!=='f29';     // excluye la determinación mensual del IVA
-  const soloDoc = a => a.origen==='doc';   // solo lo que vino de un documento
+  // La determinación mensual del IVA cruza débito contra crédito (o contra impuestos por
+  // pagar): se excluye para comparar lo que dejaron los documentos. Sirve también para
+  // un libro importado, donde esos asientos no vienen marcados como F29.
+  const toca = (a, roles) => a.lineas.some(l=>roles.includes(rolCuenta(l.c)));
+  // determinación: cruza IVA débito o crédito contra la otra cuenta del IVA, el remanente o los impuestos por pagar
+  const noF29 = a => a.origen!=='f29' && !( (toca(a, ['ivaDeb']) && toca(a, ['ivaCred','remanente','impuestos'])) || (toca(a, ['ivaCred']) && toca(a, ['remanente'])) );
+  const soloDoc = a => a.origen==='doc' || a.origen==='importado';
 
   const f = f29Ano().slice(0, S.ui.mes+1);
   const sum = k => f.reduce((a,r)=>a+r[k],0);
   const tVentas = sum('netoAfecto') + sum('netoExento');
 
-  const cIngresos = movCta('4101').acreedor + movCta('4102').acreedor + movCta('4103').acreedor;
+  // ingresos del giro de la contabilidad (todas las cuentas de ingreso ordinario), sin cierres
+  const cIngresos = (()=>{ let v = 0; lista.forEach(a=>{ if(a.origen==='cierre') return; a.lineas.forEach(l=>{ const t = CTA[l.c];
+    if(t && t.tipo==='ingreso' && t.sub!=='otros') v += num(l.h) - num(l.d); }); }); return v; })();
   const d = cuadraDiario(), b = esf(lista);
 
   const chk = [
@@ -3924,25 +4227,28 @@ function cuadratura(){
      ex:'Suma del Debe contra suma del Haber de todos los asientos.'},
     {n:'Activo contra pasivo más patrimonio', t:b.activo, c:b.total, duro:1,
      ex:'Ecuación del estado de situación financiera.'},
-    {n:'IVA débito fiscal', t:sum('debito'), c:movCta('2103',noF29).acreedor, duro:1,
-     ex:'Débito del F29 contra el saldo que los documentos dejaron en la cuenta 2103.'},
-    {n:'IVA crédito fiscal', t:sum('cred'), c:movCta('1106',noF29).deudor, duro:1,
-     ex:'Crédito del F29 contra el saldo que los documentos dejaron en la cuenta 1106.'},
+    {n:'IVA débito fiscal', t:sum('debito'), c:movCta('ivaDeb',noF29).acreedor, duro:1,
+     ex:'Débito del F29 contra lo que los documentos abonaron al IVA débito (' + (ctasConRol('ivaDeb').join(', ')||'2103') + '), sin la determinación mensual.'},
+    {n:'IVA crédito fiscal', t:sum('cred'), c:movCta('ivaCred',noF29).deudor, duro:1,
+     ex:'Crédito del F29 contra lo que los documentos cargaron al IVA crédito (' + (ctasConRol('ivaCred').join(', ')||'1106') + '), sin la determinación mensual.'},
     {n:'Ventas netas y exentas', t:tVentas, c:cIngresos, duro:1,
-     ex:'Base del registro de ventas contra los ingresos de las cuentas 4101, 4102 y 4103.'},
-    {n:'Impuesto adicional DL 825 débito', t:sum('ilaD'), c:movCta('2109',noF29).acreedor, duro:1,
-     ex:'Impuesto adicional recargado en ventas contra la cuenta 2109.'},
-    {n:'Impuesto adicional DL 825 crédito', t:sum('ilaC'), c:movCta('1110',noF29).deudor, duro:1,
-     ex:'Impuesto adicional soportado en compras contra la cuenta 1110.'},
+     ex:'Base del registro de ventas contra los ingresos ordinarios de la contabilidad.'},
+    {n:'Impuesto adicional DL 825 débito', t:sum('ilaD'), c:movCta('ilaDeb',noF29).acreedor, duro:1,
+     ex:'Impuesto adicional recargado en ventas contra su cuenta de débito.'},
+    {n:'Impuesto adicional DL 825 crédito', t:sum('ilaC'), c:movCta('ilaCred',noF29).deudor, duro:1,
+     ex:'Impuesto adicional soportado en compras contra su cuenta de crédito.'},
     {n:'Retenciones de honorarios', t:sum('ret'), c:movCta('2105',soloDoc).acreedor, duro:0,
      ex:'Retenciones del F29 contra lo que las boletas de honorarios abonaron a la cuenta 2105.'},
-    {n:'PPM enterados', t:sum('ppm'), c:movCta('1108').deudor, duro:0,
-     ex:'PPM del F29 contra los cargos a la cuenta 1108.'}
+    {n:'PPM enterados', t:sum('ppm'), c:movCta('ppm').deudor, duro:0,
+     ex:'PPM del F29 contra los cargos a la cuenta de PPM por recuperar (' + (ctasConRol('ppm').join(', ')||'1108') + ').'}
   ];
+  // sin boletas de honorarios cargadas, la retención no tiene contra qué compararse
+  const hayHon = S.docs.some(d=>d.clase==='honorario');
   chk.forEach(x=>{
     x.t = R(x.t); x.c = R(x.c); x.dif = x.t - x.c;
     x.ok = Math.abs(x.dif) <= 2;
     x.nivel = x.ok ? 'ok' : (!x.duro && x.c === 0 ? 'pendiente' : 'error');
+    if(!x.ok && /honorarios/.test(x.n) && !hayHon){ x.nivel = 'sindatos'; x.ex += ' No hay boletas de honorarios cargadas: el control no aplica.'; }
   });
   return {chk, tVentas, cIngresos,
           ok: chk.every(x=>x.nivel==='ok'),
@@ -4015,6 +4321,26 @@ function revisorContable(){
         'Un activo con saldo acreedor o un pasivo con saldo deudor casi siempre es un asiento mal imputado, o un pago registrado dos veces.',
         'Revisa el mayor de esas cuentas y busca el movimiento que las dio vuelta.');
 
+  // Existencias que no se movieron en todo el ejercicio mientras las compras van al costo:
+  // el costo de ventas queda igual a las compras y el margen bruto no es confiable.
+  const movidaEnEj = c => lista.some(a=>a.origen!=='apertura' && a.lineas.some(l=>l.c===c));
+  const existencias = Object.keys(m).filter(c=>CTA[c] && CTA[c].tipo==='activo' && CTA[c].clase!=='nc' && /existencia|inventario|mercaderia|ganado/.test(normCab(CTA[c].nom)) && sal(c) > 2);
+  const quietas = existencias.filter(c=>!movidaEnEj(c));
+  if(quietas.length && r.costo > 0)
+    add('alto','Las existencias no se han actualizado en el ejercicio',
+        quietas.map(c=>c+' '+nomCta(c)+': '+fmt(sal(c))+' sin movimientos desde la apertura').join(' · ') + '. Mientras tanto el costo de ventas suma '+fmt(r.costo)+'.',
+        'Con inventario periódico, el costo de ventas es inventario inicial más compras menos inventario final. Sin el inventario final el costo queda sobre o subestimado y el margen bruto no sirve para decidir (NIIF PYMES sección 13).',
+        'Haz o pide la toma de inventario al corte y registra el ajuste de existencias contra el costo de ventas.');
+
+  // Activo fijo con saldo y sin depreciación registrada en el ejercicio
+  const fijos = Object.keys(m).filter(c=>CTA[c] && CTA[c].tipo==='activo' && CTA[c].clase==='nc' && !/terreno/.test(normCab(CTA[c].nom)) && sal(c) > 2);
+  const hayDep = Object.keys(m).some(c=>CTA[c] && CTA[c].tipo==='gasto' && /depreciacion|amortizacion/.test(normCab(CTA[c].nom)) && R(m[c].debe - m[c].haber) > 0);
+  if(fijos.length && !hayDep && lista.some(a=>a.fecha.slice(5,7) >= '03'))
+    add('alto','El activo fijo no tiene depreciación en el ejercicio',
+        fijos.map(c=>c+' '+nomCta(c)+': '+fmt(sal(c))).join(' · ') + '. No hay gasto por depreciación registrado.',
+        'La depreciación es un gasto del período aunque no salga plata: sin ella el resultado está sobrestimado y el activo, inflado (NIIF PYMES sección 17).',
+        'Registra la depreciación mensual desde Cierre › Activo fijo, o pide el cuadro de depreciación al contador.');
+
   // existencias negativas
   if(sal('1105') < -2)
     add('alto','Las existencias quedaron en negativo',
@@ -4082,7 +4408,8 @@ function revisorContable(){
 
   // documentos importados todos a la misma cuenta
   const porCta = {};
-  S.docs.filter(d=>d.importado && d.clase==='compra').forEach(d=>{ porCta[d.cuenta]=(porCta[d.cuenta]||0)+1; });
+  // solo cuentan los que generaron asiento: los que vienen solo para el F29 no tocan la contabilidad
+  S.docs.filter(d=>d.importado && d.clase==='compra' && !d.sinAsiento).forEach(d=>{ porCta[d.cuenta]=(porCta[d.cuenta]||0)+1; });
   const ctasImp = Object.keys(porCta);
   if(ctasImp.length===1 && porCta[ctasImp[0]] >= 8)
     add('medio','Todas las compras importadas quedaron en una sola cuenta',
@@ -4098,6 +4425,10 @@ function revisorContable(){
 function declaracionesJuradas(){
   const m = saldos(asientosDelEjercicio());
   const tiene = c => !!m[c];
+  // con el plan del cliente los códigos no son los de la app: se busca por el nombre de la cuenta de gasto
+  const gastoCon = re => Object.keys(m).find(c=>CTA[c] && CTA[c].tipo==='gasto' && re.test(normCab(CTA[c].nom)) && R(m[c].debe - m[c].haber) > 0);
+  const ctaSueldos = tiene('5102') ? '5102' : gastoCon(/remuneracion|sueldo|salario/);
+  const ctaHonor = tiene('5109') ? '5109' : gastoCon(/honorario/);
   const D = [];
   const reg = S.emp.regimen;
   D.push({c:'1847', n:'Balance tributario de 8 columnas', quien:'Contribuyentes de primera categoría con contabilidad completa',
@@ -4112,9 +4443,9 @@ function declaracionesJuradas(){
     D.push({c:'1947', n:'Base imponible del régimen transparente', quien:'Pro Pyme Transparente',
             aplica:true, mes:'marzo', nota:'Los dueños tributan por la RLI aunque no retiren.'});
   D.push({c:'1887', n:'Rentas del Art. 42 N°1: sueldos', quien:'Empleadores que pagaron remuneraciones',
-          aplica: tiene('5102'), mes:'marzo', nota: tiene('5102')?'Hay remuneraciones registradas en la cuenta 5102.':'No se detectaron remuneraciones.'});
+          aplica: !!ctaSueldos, mes:'marzo', nota: ctaSueldos?'Hay remuneraciones registradas en la cuenta '+ctaSueldos+' '+nomCta(ctaSueldos)+'.':'No se detectaron remuneraciones.'});
   D.push({c:'1879', n:'Retenciones del Art. 42 N°2: honorarios', quien:'Quien pagó boletas de honorarios y retuvo',
-          aplica: tiene('5109'), mes:'marzo', nota: tiene('5109')?'Hay honorarios registrados en la cuenta 5109.':'No se detectaron honorarios.'});
+          aplica: !!ctaHonor, mes:'marzo', nota: ctaHonor?'Hay honorarios registrados en la cuenta '+ctaHonor+' '+nomCta(ctaHonor)+'.':'No se detectaron honorarios.'});
   D.push({c:'1929', n:'Operaciones en el exterior', quien:'Quien remesó al exterior',
           aplica:false, mes:'junio', nota:'Se activa si registras remesas afectas al Impuesto Adicional.'});
   D.push({c:'1907', n:'Precios de transferencia', quien:'Operaciones con partes relacionadas del exterior',
@@ -4221,10 +4552,11 @@ function indicadores(){
   const A = f29Ano(), idx = C.mesIdx;
   const meses = idx + 1;
 
-  const caja = sal('1101') + sal('1102');
-  const clientes = sal('1103');
-  const proveedores = -sal('2101');
-  const impuestos = -(sal('2103') + sal('2105') + sal('2106') + sal('2109') + sal('2110'));
+  const suma = rol => ctasConRol(rol).reduce((t,c)=>t + sal(c), 0);
+  const caja = suma('efectivo');
+  const clientes = suma('clientes');
+  const proveedores = -suma('proveedores');
+  const impuestos = -(suma('ivaDeb') + suma('impuestos') + suma('personal') + suma('ilaDeb'));
   const corriente = E.pc ? E.ac / E.pc : null;
   const trabajo = E.ac - E.pc;
   const margen = r.ingresos ? r.bruto / r.ingresos : null;
@@ -4256,7 +4588,7 @@ function indicadores(){
   const conVentas = ventasMes.filter(x=>x>0).length;
   const diasCobro = ventaProm ? clientes / (ventaProm/30) : null;
   const mesesCaja = null;
-  const gastoMes = meses ? (r.costo + r.oper + r.fin) / meses : 0;
+  const gastoMes = meses ? (r.costo + r.oper + r.fin + r.otrosGas) / meses : 0;
   const autonomia = gastoMes > 0 ? caja / gastoMes : null;
 
   const L = [];
@@ -4807,7 +5139,7 @@ function filasEEFF(lista, forma){
   const esAct = t => t.tipo==='activo' || t.tipo==='activoC';
   const fuera = cods.filter(c=>!CTA[c] || !['activo','activoC','pasivo','patrimonio','patrimonioD','ingreso','gasto'].includes(CTA[c].tipo))
     .map(c=>({c, nom:nomCta(c) + ' (fuera del plan)', v:sal(c)})).filter(vale);
-  const gastoOper = t => t.tipo==='gasto' && !['costo','financiero','impuesto'].includes(t.sub);
+  const gastoOper = t => t.tipo==='gasto' && !['costo','financiero','otrosgastos','impuesto'].includes(t.sub);
   const esf_ = [
     {sec:'Activo corriente'}, ...grupo(t=>esAct(t) && t.clase!=='nc'), ...fuera, {tot:'Total activo corriente', v:E.ac},
     {sec:'Activo no corriente'}, ...grupo(t=>esAct(t) && t.clase==='nc'), {tot:'Total activo no corriente', v:E.anc},
@@ -4825,6 +5157,7 @@ function filasEEFF(lista, forma){
     ...(hay('otrosIng', r.otrosIng) ? [{sec:'Otros ingresos'}, ...grupo(t=>t.tipo==='ingreso' && t.sub==='otros', true)] : []),
     {tot:'Resultado operacional', v:r.operacional},
     ...(hay('fin', r.fin) ? grupo(t=>t.tipo==='gasto' && t.sub==='financiero') : [{nom:'Gastos financieros', v:0}]),
+    ...(hay('otrosGas', r.otrosGas) ? [{sec:'Otros gastos no operacionales'}, ...grupo(t=>t.tipo==='gasto' && t.sub==='otrosgastos')] : []),
     {tot:'Resultado antes de impuesto', v:r.antesImp},
     ...(hay('imp', r.imp) ? grupo(t=>t.tipo==='gasto' && t.sub==='impuesto') : [{nom:'Impuesto a la renta', v:0}]),
     {tot:'Resultado del ejercicio', v:r.neto}
@@ -5116,7 +5449,7 @@ function vPanel(){
       <div class="b-col">
         <div class="b-lab">Circuito contable · ingresos del año</div>
         <div class="b-val">${$$(cu.cIngresos)}</div>
-        <div class="tiny">cuentas 4101 y 4102 del libro mayor</div>
+        <div class="tiny">cuentas de ingresos ordinarios del libro mayor</div>
       </div>
     </div>
     <div class="seam ${seam}"><i></i><i></i></div>
@@ -5133,8 +5466,8 @@ function vPanel(){
       <div class="s">${r.tPPM==null?'tasa variable, ingrésala en Ajustes':'tasa '+pct(r.tPPM)}</div></div>
     <div class="kpi"><div class="l">Total a enterar</div><div class="v">${$$(r.total)}</div>
       <div class="s">IVA + ILA + PPM + retenciones</div></div>
-    <div class="kpi"><div class="l">Resultado del ejercicio</div><div class="v">${$$(rt.eri.neto)}</div>
-      <div class="s">antes de impuesto ${$$(rt.eri.antesImp)}</div></div>
+    <div class="kpi"><div class="l">Resultado al corte</div><div class="v">${$$(eri(corte().lista).neto)}</div>
+      <div class="s">${esc(corte().etiqueta)}</div></div>
   </div>
 
   ${urgentes.length?`<div class="card" style="border-left:4px solid var(--bad)">
@@ -5202,7 +5535,7 @@ function tarjetaGraficosPanel(){
     <h3>Caja, cobranza y gastos</h3>
     <div class="split2">
       ${gCaja ? `<div>${gCaja}<div class="tiny">${FC.total.op >= 0 ? 'La operación generó ' + $$(FC.total.op) : 'La operación consumió ' + $$(-FC.total.op)} en el período. Detalle en Análisis › Flujo de caja.</div></div>` : ''}
-      ${gAnt ? `<div>${gAnt}<div class="tiny">${X.T.total ? (vencido ? Math.round(vencido / X.T.total * 100) + '% de lo que deben los clientes tiene más de 30 días.' : 'Todo lo que deben los clientes tiene menos de 30 días.') : ''} Detalle por cliente en Auxiliares.</div></div>` : ''}
+      ${gAnt ? `<div>${gAnt}<div class="tiny">${X.T.total ? (vencido ? Math.round(vencido / Math.max(1, X.T.tramos.reduce((a,b)=>a+Math.max(0,b),0)) * 100) + '% de lo facturado pendiente tiene más de 30 días.' + (X.T.sinIdentificar ? ' Hay ' + $$(-X.T.sinIdentificar) + ' en cobros sin RUT que no se pudieron aplicar.' : '') : 'Todo lo que deben los clientes tiene menos de 30 días.') : ''} Detalle por cliente en Auxiliares.</div></div>` : ''}
       ${gGas ? `<div>${gGas}<div class="tiny">${top.length ? esc(top[0].n) + ' es el gasto más grande: ' + Math.round(top[0].v / totG * 100) + '% del total.' : ''}</div></div>` : ''}
     </div></div>`;
 }
@@ -5222,7 +5555,7 @@ function vDocs(){
     <thead><tr><th>Fecha</th><th>Documento</th><th>Contraparte</th><th class="n op">Neto</th><th class="n op">Exento</th><th class="n op">IVA</th><th class="n op">Adicional</th><th class="n">Total</th></tr></thead>
     <tbody>${L.length? L.map(d=>`<tr>
       <td class="cod">${d.fecha.slice(8)}-${d.fecha.slice(5,7)}</td>
-      <td style="white-space:nowrap">${esc(dteAbr(d.dte))}${d.nc?' <span class="flag f-warn">NC</span>':''}<div class="tiny">N° ${esc(d.folio||'—')} · neto ${fmt(d.neto)}</div></td>
+      <td style="white-space:nowrap">${esc(dteAbr(d.dte))}${d.nc?' <span class="flag f-warn">NC</span>':''}<div class="tiny">N° ${esc(d.folio||'—')} · neto ${fmt(d.neto)}${d.sinAsiento?' · solo F29':''}${d.liqFactura?' · recibida':''}${d.periodo && d.periodo!==ymOf(d.fecha)?' · período '+esc(d.periodo):''}</div></td>
       <td>${esc(d.contraparte||'')}<div class="tiny">${esc(nomCta(d.cuenta))}${d.clase==='compra'&&!d.creditoIva?' · sin crédito':''}</div></td>
       <td class="n op">${fmt(d.neto)}</td><td class="n op">${d.exento?fmt(d.exento):'<span class="z">—</span>'}</td>
       <td class="n op">${d.iva?fmt(d.iva):'<span class="z">—</span>'}</td>
@@ -5500,7 +5833,8 @@ function formImport(){
         <select id="i_cta">${ctas.map(c=>`<option value="${c}"${c===imp.cuenta?' selected':''}>${c} · ${esc(nomCta(c))}</option>`).join('')}</select></div>
       ${an.clase==='compra'?`<div style="align-self:end"><label><input type="checkbox" id="i_cred" ${imp.credito?'checked':''} style="width:auto;margin-right:6px">Dan derecho a crédito fiscal</label></div>`:'<div></div>'}
     </div>
-    <div class="tiny" style="margin-top:6px">Todas quedan a crédito, con la misma cuenta. Después puedes corregir las que correspondan desde el libro diario. Los documentos que ya estén cargados no se duplican.</div>
+    <label style="margin-top:8px"><input type="checkbox" id="i_sinas" ${(imp.sinAsiento!==undefined ? imp.sinAsiento : hayLibroImportado())?'checked':''} style="width:auto;margin-right:6px">La contabilidad ya viene del libro diario importado: cargar solo para el F29, sin asientos</label>
+    <div class="tiny" style="margin-top:6px">Todas quedan a crédito, con la misma cuenta. Después puedes corregir las que correspondan desde el libro diario. Los documentos que ya estén cargados no se duplican.${hayLibroImportado() ? ' Este ejercicio ya tiene un libro diario importado: si los documentos también generan asiento, las ventas y compras quedarían dos veces.' : ''}</div>
     <div class="row" style="margin-top:10px"><button class="btn" id="i_ok">Cargar ${an.docs.length} documento(s)</button></div>`:''}
 
     ${an.problemas.length?`<details style="margin-top:8px"><summary>Filas que se saltan (${an.problemas.length})</summary>
@@ -5552,12 +5886,14 @@ function bindImport(){
   };
   const c = document.getElementById('i_cta'); if(c) c.onchange = ()=>{ imp.cuenta = c.value; };
   const cr = document.getElementById('i_cred'); if(cr) cr.onchange = ()=>{ imp.credito = cr.checked; };
+  const sa = document.getElementById('i_sinas'); if(sa) sa.onchange = ()=>{ imp.sinAsiento = sa.checked; };
   const ok = document.getElementById('i_ok');
   if(ok) ok.onclick = ()=>{
-    const n = confirmarImport(imp.an, imp.cuenta || (imp.clase==='venta'?'4101':'1105'), imp.credito);
+    const sin = imp.sinAsiento!==undefined ? imp.sinAsiento : hayLibroImportado();
+    const n = confirmarImport(imp.an, imp.cuenta || (imp.clase==='venta'?'4101':'1105'), imp.credito, sin);
     imp = {txt:'', an:null, clase:'', cuenta:'', credito:true, filas:null, hojas:null, hoja:0};
     docClase = null; guardar(); render();
-    toast(n + ' documento(s) cargados con sus asientos');
+    toast(n + ' documento(s) cargados' + (sin ? ' solo para el F29' : ' con sus asientos'));
   };
 }
 
@@ -5709,7 +6045,7 @@ function refrescaFin(){ clearTimeout(finT); finT = setTimeout(()=>{ if(S.ui.vist
 /* ---- banco ---- */
 let car = {txt:'', an:null, filas:null, hojas:null, hoja:0, manual:false, mapaMan:null, mapaIni:undefined};
 function vBanco(){
-  const hayMovs = (S.banco.movs||[]).length;
+  const hayMovs = movsBanco().length;
   const I = hayMovs ? informeConciliacion(S.banco.corte) : null;
   const linea = (n,v,cls) => `<tr><td>${n}</td><td class="n ${cls||''}">${$$(v)}</td></tr>`;
 
@@ -5721,7 +6057,8 @@ function vBanco(){
       <div><label>Archivo</label><input type="file" id="b_file" accept=".csv,.txt,.xlsx,.xls,.pdf,.docx,text/csv,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
         <div class="tiny">CSV, Excel, PDF o una tabla de Word. Si el PDF viene escaneado no hay texto que leer y te lo dirá.</div></div>
       <div><label>Cuenta contable del banco</label><select id="b_cta">
-        ${['1102','1101'].map(c=>`<option value="${c}"${c===S.banco.cuenta?' selected':''}>${c} · ${esc(nomCta(c))}</option>`).join('')}</select></div>
+        ${[...new Set(cuentasBanco().map(b=>b.cuenta).concat(ctasConRol('efectivo')))].filter(c=>CTA[c]).map(c=>`<option value="${c}"${c===S.banco.cuenta?' selected':''}>${c} · ${esc(nomCta(c))}${movsBanco(c).length?' · '+movsBanco(c).length+' mov.':''}</option>`).join('')}</select>
+        <div class="tiny">Si la cartola trae el número de cuenta, se asigna sola a la cuenta del plan que lo lleva en su nombre.</div></div>
     </div>
     <div style="margin-top:8px"><label>O pega el contenido</label>
       <textarea id="b_txt" rows="3" placeholder="Pega las filas de la cartola">${esc(car.txt.slice(0,3000))}</textarea></div>
@@ -5762,13 +6099,13 @@ function vBanco(){
   <div class="kpis">
     <div class="kpi"><div class="l">Saldo según cartola</div><div class="v">${$$(I.saldoCartola)}</div><div class="s">al ${I.corte.slice(8)}-${I.corte.slice(5,7)}</div></div>
     <div class="kpi"><div class="l">Saldo según libros</div><div class="v">${$$(I.saldoLibro)}</div><div class="s">cuenta ${S.banco.cuenta}</div></div>
-    <div class="kpi"><div class="l">Conciliados</div><div class="v">${E.pares.length}</div><div class="s">de ${S.banco.movs.length} movimientos</div></div>
+    <div class="kpi"><div class="l">Conciliados</div><div class="v">${E.pares.length}</div><div class="s">de ${movsBanco().length} movimientos</div></div>
     <div class="kpi"><div class="l">Por resolver</div><div class="v" style="color:${E.soloBanco.length+E.soloLibro.length?'var(--warn)':'var(--ok)'}">${E.soloBanco.length+E.soloLibro.length}</div><div class="s">partidas sueltas</div></div>
   </div>
 
   ${(()=>{
     // saldo de la cuenta día a día, con los movimientos de la cartola en orden
-    const ms = S.banco.movs.slice().sort((a,b)=> a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : 0);
+    const ms = movsBanco().slice().sort((a,b)=> a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : 0);
     const conS = ms.find(m => m.saldo !== null && m.saldo !== undefined);
     const ini = conS ? conS.saldo - ms.slice(0, ms.indexOf(conS) + 1).reduce((a, m) => a + m.monto, 0) : num(S.banco.saldoInicial);
     const gr = graficoSaldo(ms, ini);
@@ -6315,6 +6652,12 @@ function lineaHTML(i, c, d, h, cc){
 
 /* ---- mayor ---- */
 function vMayor(){
+  // si la cuenta elegida no tiene movimientos (por ejemplo, la 1102 del plan base cuando
+  // se trabaja con el plan del cliente), se abre la primera de efectivo que sí los tenga
+  const conMov = new Set(); asientosDelEjercicio().forEach(a=>a.lineas.forEach(l=>conMov.add(l.c)));
+  if(!conMov.has(S.ui.ctaMayor) && conMov.size){
+    S.ui.ctaMayor = ctasConRol('efectivo').find(x=>conMov.has(x)) || [...conMov].sort()[0];
+  }
   const c = S.ui.ctaMayor;
   const L = asientosDelEjercicio().filter(a=>a.lineas.some(l=>l.c===c));
   let s=0; const deu = esDeudora(CTA[c]?CTA[c].tipo:'activo');
@@ -6370,7 +6713,7 @@ function tablaComparada(filas, tits){
       return filaMulti(f, f.vs, f.sec ? '' : `<td class="n">${R(v.d) ? fmt(v.d) : '<span class="z">—</span>'}</td><td class="n tiny">${R(v.d) ? pctVar(v.p) : ''}</td>`, tits.length + 3);
     }).join('')}</tbody></table></div>`;
 }
-function resumenERI(l){ const r = eri(l); return {ing: r.ingresos + r.otrosIng, costo: r.costo, gasto: r.oper + r.fin + r.imp, neto: r.neto}; }
+function resumenERI(l){ const r = eri(l); return {ing: r.ingresos + r.otrosIng, costo: r.costo, gasto: r.oper + r.fin + r.otrosGas + r.imp, neto: r.neto}; }
 
 function anComparativo(C){
   const m = S.ui.cmpModo === 'mes' ? 'mes' : 'anual';
@@ -6517,16 +6860,17 @@ function vAux(){
     <thead><tr><th>Contraparte</th>${TRAMOS_AUX.map(t=>`<th class="n op">${t[1]}</th>`).join('')}<th class="n">Saldo</th></tr></thead>
     <tbody>${X.filas.map(g=>`<tr><td>${esc(g.nombre)}<div class="tiny">${g.rut?esc(fmtRut(g.rut)):'sin RUT'} · ${g.docs.length} doc.</div></td>
       ${g.tramos.map(v=>`<td class="n op">${R(v)?fmt(v):'<span class="z">—</span>'}</td>`).join('')}<td class="n"><b>${fmt(g.total)}</b></td></tr>`).join('')}</tbody>
-    <tfoot><tr class="tot"><td>Total</td>${X.T.tramos.map(v=>`<td class="n op">${R(v)?fmt(v):''}</td>`).join('')}<td class="n">${fmt(X.T.total)}</td></tr></tfoot>
+    <tfoot>${X.T.sinIdentificar ? `<tr><td>${lado==='cli'?'Cobros':'Pagos'} sin RUT, sin aplicar a una factura</td>${TRAMOS_AUX.map(()=>'<td class="op"></td>').join('')}<td class="n" style="color:var(--warn)">${fmt(X.T.sinIdentificar)}</td></tr>` : ''}
+      <tr class="tot"><td>Total</td>${X.T.tramos.map(v=>`<td class="n op">${R(v)?fmt(v):''}</td>`).join('')}<td class="n">${fmt(X.T.total)}</td></tr></tfoot>
   </table></div>` : `<div class="card"><p class="sub" style="margin:0">No hay ${quien} con saldo al ${esc(C.hasta)}. El auxiliar se arma con los documentos registrados a crédito.</p></div>`;
   const hoyCorte = hoyISO() < C.hasta ? hoyISO() : C.hasta;
   const detalle = X.filas.map(g=>`<details class="card"${S.ui.auxAbierto===g.k?" open":""}><summary><b>${esc(g.nombre)}</b> · ${g.rut?esc(fmtRut(g.rut)):'sin RUT'} · saldo ${$$(g.total)}${g.maxDias>90?' <span class="flag f-bad">más de 90 días</span>':g.maxDias>30?' <span class="flag f-warn">vencido</span>':''}</summary>
     <div class="tw" style="margin-top:8px"><table>
       <thead><tr><th>Documento</th><th>Fecha</th><th class="n">Días</th><th class="n">Monto</th><th class="n">${lado==='cli'?'Cobrado':'Pagado'}</th><th class="n">Saldo</th><th class="noprint">Registrar ${verbo}</th></tr></thead>
-      <tbody>${g.docs.map(x=>`<tr><td>${esc(dteAbr(x.d.dte))} N° ${esc(x.d.folio||'—')}${x.d.nc?' <span class="flag f-warn">NC</span>':''}</td>
+      <tbody>${g.docs.map(x=>`<tr><td>${x.d.libro ? esc(x.d.folio||'') + '<div class="tiny">' + esc(String(x.d.glosa||'').slice(0,70)) + '</div>' : esc(dteAbr(x.d.dte)) + ' N° ' + esc(x.d.folio||'—')}${x.d.nc && !x.d.libro?' <span class="flag f-warn">NC</span>':''}</td>
         <td class="cod">${esc(x.d.fecha)}</td><td class="n">${x.dias}</td><td class="n">${fmt(montoDoc(x.d)*(x.d.nc?-1:1))}</td>
         <td class="n">${x.pagado?fmt(x.pagado):'<span class="z">—</span>'}</td><td class="n"><b>${fmt(x.p)}</b></td>
-        <td class="noprint">${x.d.nc ? '<span class="tiny">rebaja el saldo</span>' : `<div class="row" style="gap:4px;flex-wrap:nowrap">
+        <td class="noprint">${x.d.libro ? '<span class="tiny">se registra en el libro</span>' : x.d.nc ? '<span class="tiny">rebaja el saldo</span>' : `<div class="row" style="gap:4px;flex-wrap:nowrap">
           <input type="date" id="axf_${x.d.id}" value="${hoyCorte}" style="width:132px">
           <input type="text" inputmode="numeric" class="mny" id="axm_${x.d.id}" value="${fmt(x.p)}" style="width:100px">
           <select id="axc_${x.d.id}" style="width:86px"><option value="${S.banco.cuenta||'1102'}">Banco</option><option value="1101">Caja</option></select>
@@ -6542,11 +6886,12 @@ function vAux(){
   <h2>Auxiliar de ${quien} por RUT</h2>
   <div class="kpis">
     <div class="kpi"><div class="l">Saldo por ${lado==='cli'?'cobrar':'pagar'}</div><div class="v">${$$(X.T.total)}</div><div class="s">${X.filas.length} contraparte(s) · ${X.T.docs} doc.</div></div>
-    <div class="kpi"><div class="l">Con más de 30 días</div><div class="v" style="color:${vencido>0?'var(--warn)':'var(--ink)'}">${$$(vencido)}</div><div class="s">${X.T.total>0?Math.round(vencido/X.T.total*100)+'% del saldo':'—'}</div></div>
+    <div class="kpi"><div class="l">Con más de 30 días</div><div class="v" style="color:${vencido>0?'var(--warn)':'var(--ink)'}">${$$(vencido)}</div><div class="s">${X.T.total>0?Math.round(vencido/Math.max(1, X.T.tramos.reduce((a,b)=>a+Math.max(0,b),0))*100)+'% de lo facturado pendiente':'—'}</div></div>
     <div class="kpi"><div class="l">Con más de 90 días</div><div class="v" style="color:${muyVencido>0?'var(--bad)':'var(--ink)'}">${$$(muyVencido)}</div><div class="s">${lado==='cli'?'candidato a deterioro':'riesgo de cobranza del proveedor'}</div></div>
     <div class="kpi"><div class="l">Contra la cuenta ${X.cta}</div><div class="v" style="color:${Math.abs(X.dif)>2?'var(--bad)':'var(--ok)'}">${Math.abs(X.dif)>2?$$(X.dif):'cuadra'}</div><div class="s">saldo contable ${$$(X.contable)}</div></div>
   </div>
-  ${Math.abs(X.dif)>2 ? `<div class="note warn">El auxiliar suma ${$$(X.T.total)} y la cuenta ${X.cta} ${esc(nomCta(X.cta))} tiene ${$$(X.contable)} al mismo corte. La diferencia de ${$$(Math.abs(X.dif))} suele venir de ${lado==='cli'?'cobros':'pagos'} registrados por asiento manual o en Banco sin amarrarlos al documento, de saldos de apertura sin detalle por RUT, o de documentos de otro ejercicio. ${lado==='cli'?'Cobra':'Paga'} desde aquí para que el documento quede saldado.</div>` : X.filas.length ? `<div class="note ok">El auxiliar cuadra con la cuenta ${X.cta} al ${esc(C.hasta)}.</div>` : ''}
+  ${Math.abs(X.dif)>2 ? `<div class="note warn">El auxiliar suma ${$$(X.T.total)} y la(s) cuenta(s) ${esc(X.cta)} tienen ${$$(X.contable)} al mismo corte. La diferencia de ${$$(Math.abs(X.dif))} suele venir de ${lado==='cli'?'cobros':'pagos'} registrados por asiento manual o en Banco sin amarrarlos al documento, de saldos de apertura sin detalle por RUT, o de documentos de otro ejercicio. ${lado==='cli'?'Cobra':'Paga'} desde aquí para que el documento quede saldado.</div>` : X.filas.length ? `<div class="note ok">El auxiliar cuadra con la cuenta ${X.cta} al ${esc(C.hasta)}.</div>` : ''}
+  ${X.modo==='libro' ? `<div class="note">Armado desde el libro diario: líneas de ${esc(X.cta)} agrupadas por el RUT de cada una, con los abonos aplicados a los cargos más antiguos.${X.T.sinIdentificar ? ` Hay ${$$(Math.abs(X.T.sinIdentificar))} en ${lado==='cli'?'cobros':'pagos'} registrados sin RUT: no se pueden aplicar a ninguna factura, así que la antigüedad de arriba está sobrestimada en esa cifra. Pide que cada ${lado==='cli'?'cobro':'pago'} se registre con el RUT de la contraparte.` : ''}</div>` : ''}
   ${mayor && X.T.total>0 && mayor.total/X.T.total>0.4 ? `<div class="note">${esc(mayor.nombre)} concentra el ${Math.round(mayor.total/X.T.total*100)}% del saldo de ${quien}.</div>` : ''}
   ${tabla}
   ${detalle}
@@ -6693,7 +7038,7 @@ function vF29(){
       ${fila('538','Total débitos', r.debito,'d')}
       <tr class="sec"><td colspan="3">Créditos</td></tr>
       ${fila('520','IVA crédito de facturas recibidas', r.cred,'h')}
-      ${fila('504','Remanente de crédito del período anterior', r.remanenteAnt,'h')}
+      ${fila('504','Remanente del período anterior' + (r.remanenteAnt ? (r.sinUTM ? ' · sin reajuste: falta la UTM' : ' reajustado por UTM ' + pctVar(r.factorRem - 1) + ' (era ' + fmt(r.remanenteAnt) + ')') : ''), r.remReaj,'h')}
       ${fila('537','Total créditos', r.credTotal,'h')}
       <tr class="sec"><td colspan="3">Determinación</td></tr>
       ${fila('089','IVA determinado a pagar', r.aPagarIVA)}
@@ -6725,7 +7070,7 @@ function vF29(){
       series: [{n:'IVA débito', v: A.map(x => x.debito), c:'var(--haber)'}, {n:'IVA crédito', v: A.map(x => x.cred), c:'var(--ok)'}],
       linea: A.some(x => x.remanenteSig) ? {n:'Remanente', v: A.map((x, i) => i <= hasta ? x.remanenteSig : null), c:'var(--debe)'} : null});
     if(!gr) return '';
-    const conPago = A.filter(x => x.aPagarIVA > 0).length, conRem = A.filter(x => x.remanenteSig > 0).length;
+    const conPago = A.filter(x => x.aPagarIVA > 0).length, conRem = A.filter((x, i) => x.remanenteSig > 0 && i <= hasta).length;
     return gr + `<div class="tiny" style="margin-bottom:10px">Cuando la columna roja supera a la verde, ese mes se paga IVA (${conPago} ${conPago === 1 ? 'mes' : 'meses'} en el año).
       Si la verde es mayor, la diferencia queda como remanente y se descuenta en los meses siguientes${conRem ? ` (${conRem} ${conRem === 1 ? 'mes' : 'meses'} con remanente)` : ''}.</div>`;
   })()}
@@ -6744,8 +7089,88 @@ function vF29(){
       <td class="n">${fmt(A.reduce((a,x)=>a+x.ppm,0))}</td>
       <td class="n">${fmt(A.reduce((a,x)=>a+x.total,0))}</td></tr></tfoot>
   </table></div>
-  <div class="note">El remanente se arrastra solo de un mes al siguiente. Si vienes de un ejercicio anterior con saldo a favor, cárgalo en Ajustes.</div>
-  </div></div>`;
+  <div class="note">El remanente se arrastra solo de un mes al siguiente y se reajusta por la variación de la UTM entre los meses en que se presentan las dos declaraciones (art. 27 del DL 825). Si vienes de un ejercicio anterior con saldo a favor, cárgalo en Ajustes.${A.some(x=>x.sinUTM && x.remanenteAnt) ? ' <b>Falta la UTM de algunos meses:</b> actualiza los parámetros en Ajustes (se traen de mindicador.cl) para que el reajuste sea exacto.' : ''}</div>
+  </div></div>
+  ${tarjetaF29Declarado(A)}`;
+}
+
+/* ---- F29 declarado contra calculado ----
+   Lo que un auditor revisa primero: si lo que se declaró al SII es lo que sale de
+   los registros. Los montos declarados se cargan desde una planilla con los códigos
+   del formulario (538, 537, 77, 62, 91…), como la que se arma desde la Carpeta
+   Tributaria, o a mano. */
+const COD_F29 = [['538','IVA débito','debito'],['520','IVA crédito del mes','cred'],['020','Exportaciones','netoExento'],['504','Remanente anterior reajustado','remReaj'],
+                 ['077','Remanente para el período siguiente','remanenteSig'],['563','Base del PPM','basePPM'],['062','PPM','ppm'],['151','Retención de honorarios','ret'],
+                 ['091','Total a pagar','total'],['547','Total determinado','total']];
+function analizarF29Declarado(filas){
+  // fila de títulos: la que trae "Período" y al menos dos códigos "(cód. 538)" o columnas que se reconocen
+  const cod = h => { const t = String(h||''); const m = t.match(/c[oó]d(?:igo)?\.?\s*(\d{2,3})/i); if(m) return m[1].padStart(3,'0');
+    const n = normCab(t);
+    if(/^ivadebito|^totaldebitos/.test(n)) return '538'; if(/^ivacreditodelmes|^creditodelmes/.test(n)) return '520';
+    if(/^remanente.*(siguiente|cf)|^remanentecf/.test(n)) return '077'; if(/^ppm/.test(n)) return '062';
+    if(/^totalapagar|^totaldeterminado/.test(n)) return '091'; if(/^baseimponible|^baseppm/.test(n)) return '563'; return null; };
+  for(let i=0;i<Math.min(filas.length,15);i++){
+    const f = filas[i] || [];
+    const ip = f.findIndex(h=>/^per[ií]odo$|^mes$/i.test(String(h).trim()));
+    const cols = {}; f.forEach((h,j)=>{ const c = cod(h); if(c && j!==ip && !cols[c]) cols[c] = j; });
+    if(ip < 0 || Object.keys(cols).length < 2) continue;
+    const out = {};
+    filas.slice(i+1).forEach(x=>{
+      const p = String(x[ip]||'').trim(); let ym = '';
+      let m = p.match(/^(\d{1,2})[-\/](\d{4})$/); if(m) ym = m[2] + '-' + m[1].padStart(2,'0');
+      if(!ym){ m = p.match(/^(\d{4})[-\/]?(\d{2})$/); if(m) ym = m[1] + '-' + m[2]; }
+      if(!ym) return;
+      out[ym] = {}; Object.keys(cols).forEach(c=>{ out[ym][c] = R(numCSV(x[cols[c]])); });
+    });
+    return {meses: out, codigos: Object.keys(cols).sort()};
+  }
+  return {error:'No encuentro una columna «Período» con códigos del F29 (por ejemplo «IVA débito (cód. 538)»).'};
+}
+function tarjetaF29Declarado(A){
+  const D = S.f29Dec || {}, ej = String(S.emp.ejercicio);
+  const meses = A.map((x, i)=>({x, ym: ej + '-' + String(i+1).padStart(2,'0')})).filter(o=>D[o.ym] || o.x.docs);
+  const filas = meses.map(({x, ym})=>{
+    const d = D[ym] || {};
+    const celdas = COD_F29.filter(c=>Object.values(D).some(v=>v[c[0]]!==undefined)).map(([c,n,k])=>{
+      // el total declarado incluye la retención de trabajadores (cód. 48), que sale de las remuneraciones
+      const dec = d[c], cal = R(x[k]||0) + ((c==='091'||c==='547') && d['048'] ? d['048'] : 0);
+      if(dec===undefined) return `<td class="n">${fmt(cal)}<div class="tiny">sin declarado</div></td>`;
+      const dif = cal - dec;
+      // en el remanente quedan unos pesos por el redondeo del reajuste de la UTM: no es un error de registro
+      const redondeo = (c==='077'||c==='504') && Math.abs(dif) <= 500;
+      return `<td class="n">${fmt(dec)}${Math.abs(dif)<=2 ? '<div class="tiny" style="color:var(--ok)">calza</div>'
+        : redondeo ? `<div class="tiny" style="color:var(--ink3)">dif ${fmt(dif)} · redondeo del reajuste</div>`
+        : `<div class="tiny" style="color:var(--bad)">calc. ${fmt(cal)} · dif ${fmt(dif)}</div>`}</td>`;
+    }).join('');
+    return `<tr><td>${MESES[+ym.slice(5)-1].slice(0,3)} ${ym.slice(0,4)}</td>${celdas}</tr>`;
+  });
+  const cols = COD_F29.filter(c=>Object.values(D).some(v=>v[c[0]]!==undefined));
+  return `<div class="card" style="margin-top:14px">
+    <h3>F29 declarado contra calculado</h3>
+    <p class="sub">Carga lo que se declaró al SII (una planilla con la columna «Período» y los códigos del formulario, como la que se arma desde la Carpeta Tributaria) y la app lo compara mes a mes con lo que sale de los registros. Una diferencia es una corrección pendiente o un error en los registros.${Object.values(D).some(v=>v['048']) ? ' Al total calculado se le suma la retención de trabajadores declarada (cód. 48), porque sale de las remuneraciones.' : ''}</p>
+    ${cols.length ? `<div class="tw"><table><thead><tr><th>Período</th>${cols.map(c=>`<th class="n">${c[0]} · ${esc(c[1])}</th>`).join('')}</tr></thead><tbody>${filas.join('')}</tbody></table></div>` : ''}
+    <div class="row noprint" style="margin-top:8px">
+      <input type="file" id="f29d_file" accept=".csv,.txt,.xlsx,.xls" style="max-width:280px">
+      ${cols.length ? '<button class="btn ghost sm" id="f29d_borrar">Quitar lo declarado</button>' : ''}
+    </div>
+  </div>`;
+}
+function bindF29(){
+  const f = document.getElementById('f29d_file');
+  if(f) f.onchange = async ()=>{
+    const file = f.files[0]; if(!file) return;
+    try{
+      const r = await leerArchivoTabla(file);
+      const hojas = r.hojas && r.hojas.length ? r.hojas.map(h=>h.filas) : [r.filas || parseCSV(r.texto, detectarDelim(r.texto))];
+      let an = null;
+      for(const filas of hojas){ const x = analizarF29Declarado(filas); if(!x.error){ an = x; break; } }
+      if(!an){ toast('No encontré los códigos del F29 en el archivo'); return; }
+      S.f29Dec = Object.assign(S.f29Dec || {}, an.meses);
+      guardar(); render(); toast(Object.keys(an.meses).length + ' período(s) declarados cargados');
+    }catch(e){ toast('No se pudo leer: ' + e.message); }
+  };
+  const b = document.getElementById('f29d_borrar');
+  if(b) b.onclick = ()=>{ if(confirm('¿Quitar los montos declarados cargados?')){ S.f29Dec = {}; guardar(); render(); } };
 }
 
 /* ---- planificación ---- */
@@ -6869,9 +7294,15 @@ function revisionPeriodo(ym){
   const as = S.asientos.filter(a=>ymOf(a.fecha)===ym);
   const desc = as.filter(a=>{ let d=0,h=0; a.lineas.forEach(l=>{d+=num(l.d);h+=num(l.h)}); return R(d)!==R(h); });
   const docs = docsMes(ym);
-  const sinAsiento = docs.filter(x=>!(x.asientos||[]).some(id=>S.asientos.some(a=>a.id===id)));
+  const sinAsiento = docs.filter(x=>!x.sinAsiento && !(x.asientos||[]).some(id=>S.asientos.some(a=>a.id===id)));
   const movs = ((S.banco && S.banco.movs)||[]).filter(m=>ymOf(m.fecha)===ym);
-  const sinConc = movs.length ? emparejar().soloBanco.filter(m=>ymOf(m.fecha)===ym && !m.aid).length : 0;
+  // se revisa cada cuenta corriente con su propia conciliación
+  let sinConc = 0;
+  if(movs.length){
+    const activa = S.banco.cuenta;
+    [...new Set(movs.map(m=>m.cb || activa))].forEach(c=>{ S.banco.cuenta = c; sinConc += emparejar().soloBanco.filter(m=>ymOf(m.fecha)===ym && !m.aid).length; });
+    S.banco.cuenta = activa;
+  }
   const mi = +ym.slice(5) - 1, f = ym.slice(0,4)==String(S.emp.ejercicio) ? f29Ano()[mi] : null;
   const ivaPend = f && (f.debito || f.cred) && !as.some(a=>a.origen==='f29');
   const depPend = (S.activos||[]).length && asientoDepreciacionMes(ym) && !as.some(a=>a.origen==='dep');
@@ -7209,7 +7640,7 @@ function vCuadre(){
   <div class="ctrl-grid">${c.chk.map(x=>`
     <div class="ctrl ${x.nivel}">
       <div class="ctrl-h"><b>${esc(x.n)}</b>
-        <span class="flag ${x.nivel==='ok'?'f-ok':x.nivel==='pendiente'?'f-warn':'f-bad'}">${x.nivel==='ok'?'cuadra':x.nivel==='pendiente'?'sin asentar':'revisar'}</span></div>
+        <span class="flag ${x.nivel==='ok'?'f-ok':x.nivel==='pendiente'||x.nivel==='sindatos'?'f-warn':'f-bad'}">${x.nivel==='ok'?'cuadra':x.nivel==='pendiente'?'sin asentar':x.nivel==='sindatos'?'sin datos':'revisar'}</span></div>
       <div class="ctrl-n">
         <div><span class="l">Tributario</span><span class="v">${$$(x.t)}</span></div>
         <div><span class="l">Contable</span><span class="v">${$$(x.c)}</span></div>
@@ -7621,6 +8052,7 @@ function render(){
   if(v==='banco'){ bindBanco(); }
   if(v==='revisor'){ bindRevisor(); }
   if(v==='cierre'){ bindCierre(); }
+  if(v==='f29'){ bindF29(); }
   if(v==='compartir'){ bindCompartir(); }
   if(v==='config'){ bindConfig(); bindPlanCuentas(); }
   if(!memoria) window.scrollTo({top:0});
@@ -7661,9 +8093,13 @@ function cargaPlantilla(k){
   if(k==='__iva' || k==='__ppm' || k==='__ret'){
     const A = f29Ano(), r = A[S.ui.mes];
     if(k==='__iva'){
+      // con las cuentas de IVA del plan en uso (también si es el del cliente)
+      const cDeb = ctaRol('ivaDeb','2103'), cCred = ctaRol('ivaCred','1106'), cImp = ctaRol('impuestos','2105');
+      const reaj = R(r.remReaj - r.remanenteAnt);       // reajuste del remanente: es un ingreso (o un gasto si la UTM bajó)
       lineas = r.remanenteSig>0
-        ? [{c:'2103',d:r.debito,h:''},{c:'1106',d:'',h:r.debito}]
-        : [{c:'2103',d:r.debito,h:''},{c:'1106',d:'',h:r.cred+r.remanenteAnt},{c:'2105',d:'',h:r.aPagarIVA}];
+        ? [{c:cDeb,d:r.debito,h:''},{c:cCred,d:'',h:r.debito}]
+        : [{c:cDeb,d:r.debito,h:''},{c:cCred,d:'',h:r.cred+r.remanenteAnt},{c:cImp,d:'',h:r.aPagarIVA}]
+          .concat(reaj > 0 ? [{c:'4103',d:'',h:reaj}] : reaj < 0 ? [{c:'5104',d:-reaj,h:''}] : []);
       setVal('a_glosa','Determinación IVA '+mesTxt+' F29'+(r.remanenteSig?' remanente '+fmt(r.remanenteSig):''));
     }
     if(k==='__ppm'){ lineas=[{c:'1108',d:r.ppm,h:''},{c:'1102',d:'',h:r.ppm}]; setVal('a_glosa','PPM '+mesTxt+' F29'); }
@@ -7810,14 +8246,14 @@ document.addEventListener('click', e=>{
     return;
   }
   if(t.id==='b_ok'){
-    S.banco.movs = (S.banco.movs||[]).concat(car.an.movs).sort((a,b)=> a.fecha<b.fecha?-1:1);
-    const n = car.an.movs.length; car = {txt:'', an:null, filas:null, hojas:null, hoja:0, manual:false, mapaMan:null, mapaIni:undefined};
-    guardar(); render(); toast(n+' movimiento(s) cargados');
+    const n = agregarMovsBanco(car.an); car = {txt:'', an:null, filas:null, hojas:null, hoja:0, manual:false, mapaMan:null, mapaIni:undefined};
+    guardar(); render(); toast(n+' movimiento(s) cargados en ' + S.banco.cuenta + ' ' + nomCta(S.banco.cuenta));
     return;
   }
   if(t.id==='b_borrar'){
     if(confirm('¿Borrar los movimientos de la cartola? Los asientos que ya grabaste se mantienen.')){
-      S.banco.movs = []; car = {txt:'', an:null}; guardar(); render(); toast('Cartola borrada');
+      const cta = S.banco.cuenta;
+      S.banco.movs = (S.banco.movs||[]).filter(m=>(m.cb || cta)!==cta); car = {txt:'', an:null}; guardar(); render(); toast('Cartola de ' + cta + ' borrada');
     }
     return;
   }

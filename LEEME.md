@@ -50,6 +50,71 @@ cambiada (la línea `const CACHE`, por ejemplo `cuadratura-v3` → `cuadratura-v
 Si no la cambias, los dispositivos que ya la tienen instalada pueden seguir
 abriendo la versión vieja.
 
+## Qué cambió en la versión 5
+
+Revisión hecha con los datos reales de una empresa (libro diario de un contador,
+RCV de seis meses, dos cuentas corrientes y la Carpeta Tributaria), comparando
+cada cifra de la app contra su fuente. Lo que se corrigió:
+
+**Lectura del libro diario**
+
+- La columna «Razón social» de cada línea (la contraparte) ya no se confunde con
+  una columna de empresa. Antes, con un libro de 1.757 asientos se cargaban 13.
+- En un Excel con varias hojas, el plan de cuentas se toma como plan aunque
+  traiga sus sumas, y **su clase y rubro mandan** sobre lo que se deduce del
+  nombre. El libro mayor y el balance de comprobación del mismo archivo no se
+  cargan otra vez; las portadas y notas se informan juntas.
+- El asiento de apertura del libro se reconoce como apertura (saldo inicial),
+  no como un movimiento del ejercicio.
+- Se guarda el RUT, la razón social y el documento de cada línea.
+- Nueva línea «Otros gastos no operacionales» en el estado de resultados.
+
+**Funciones de cuenta**
+
+- La app reconoce efectivo, clientes, proveedores, IVA débito, IVA crédito,
+  remanente, PPM, impuestos y personal **por el nombre y la clasificación de la
+  cuenta**, no por códigos fijos. Así el flujo de caja, los indicadores, la
+  cuadratura y los auxiliares funcionan con el plan del cliente.
+- Lo enviado a una cuenta propia sin cartola («por conciliar») no se cuenta como
+  efectivo: va en el flujo como inversión, por criterio conservador.
+
+**Registro de compras y ventas**
+
+- La NC de exportación (112) rebaja las exportaciones; antes se sumaba.
+- La liquidación-factura recibida (43 en compras) es una venta hecha por el
+  mandatario: IVA débito, no crédito. Así cuadra con la línea «Liquidación de
+  facturas» del F29.
+- El impuesto específico a los combustibles (códigos 28 y 35) y el IVA no
+  recuperable van al costo; solo los impuestos adicionales del DL 825 dan crédito.
+- Cada documento va al **período del registro** (el del archivo del RCV), no al
+  de su fecha, como en el F29.
+- Los documentos en $0 se informan aparte, sin llamarlos error.
+- Si ya hay un libro diario importado, los documentos se cargan **solo para el
+  F29**, sin asiento: antes las ventas y compras quedaban dos veces.
+
+**F29**
+
+- El remanente se reajusta por la variación de la UTM (art. 27 del DL 825). La
+  UTM mensual se trae de mindicador.cl al actualizar parámetros.
+- Nueva tabla **F29 declarado contra calculado**: se carga una planilla con los
+  códigos (538, 520, 77, 62, 547…) y la app marca mes a mes lo que no calza.
+
+**Banco**
+
+- Varias cuentas corrientes: cada cartola se asigna sola a su cuenta por el
+  número que trae en el encabezado, y la conciliación se hace por cuenta.
+- Con cartolas que traen el saldo solo en el encabezado, se usa ese saldo
+  inicial y se reconstruye el saldo de cada movimiento.
+
+**Auxiliares y revisor**
+
+- Si los documentos vienen solo para el F29, el auxiliar se arma **desde el
+  libro**, por el RUT de cada línea (como el análisis por auxiliar de un sistema
+  contable), con los abonos aplicados a los cargos más antiguos. El RUT genérico
+  de extranjeros se agrupa por nombre, y los cobros sin RUT quedan aparte.
+- El revisor avisa existencias sin actualizar en el ejercicio y activo fijo sin
+  depreciación, y detecta remuneraciones y honorarios por el nombre de la cuenta.
+
 ## Qué cambió en la versión 4
 
 Una pestaña nueva, **Análisis**, con cuatro vistas. Todas usan el mismo corte

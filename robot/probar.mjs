@@ -444,6 +444,176 @@ caso('Exportaciones del bloque 2 llevan la misma cifra de control', ()=>{
     cierto(api.EXPORTES[k](C).includes('Cifra de control (suma del Debe);' + C.debe), k + ': lleva la cifra de control');
 });
 
+/* ---------- auditoría con datos de una empresa real (aquí, inventados con su misma forma) ---------- */
+
+// Libro en Excel con plan propio (clase y rubro), diario, mayor y balance de comprobación, como lo
+// entrega un contador. El diario trae RUT y razón social de la contraparte en cada línea.
+const LD_CAB = ['N. Asiento','Fecha','Origen','Glosa','Cuenta','Nombre de la cuenta','Debe','Haber','Documento','RUT','Razon social'];
+const ld = (n, f, o, g, c, nom, d, h, rut, rs) => [n, f, o, g, c, nom, d || '', h || '', 'doc ' + n, rut || '', rs || ''];
+const LIBRO_PROPIO = xlsx([
+  {nombre: 'Portada', filas: [['LIBRO DIARIO 2026'], ['GAMMA AGRICOLA SPA - RUT 76.900.900-1'], ['Periodo', 'enero 2026']]},
+  {nombre: 'Plan de Cuentas', filas: [['Codigo','Nombre de la cuenta','Clase','Rubro','Debitos','Creditos','Saldo'],
+    ['1-01-001','Banco Estado Cta. Cte. 12345678','ACTIVO','Activo corriente',1119000,159500,959500],
+    ['1-01-002','Banco Itau Cta. Cte. 0-222-333-4','ACTIVO','Activo corriente',650000,1000,649000],
+    ['1-02-001','Deudores comerciales nacionales','ACTIVO','Activo corriente',557000,169000,388000],
+    ['1-03-001','IVA Credito Fiscal','ACTIVO','Activo corriente',9500,0,9500],
+    ['1-06-001','Maquinaria agricola','ACTIVO','Activo no corriente',0,0,0],
+    ['2-01-001','Proveedores nacionales','PASIVO','Pasivo corriente',59500,59500,0],
+    ['2-01-002','Obligaciones por factoring','PASIVO','Pasivo corriente',0,0,0],
+    ['2-02-001','IVA Debito Fiscal','PASIVO','Pasivo corriente',0,57000,-57000],
+    ['3-01-001','Capital pagado','PATRIMONIO','Patrimonio',0,1500000,-1500000],
+    ['4-01-001','Ventas del giro','RESULTADO','Ingresos',0,500000,-500000],
+    ['5-01-001','Compras del giro','RESULTADO','Costos',50000,0,50000],
+    ['5-04-001','Gastos financieros y comisiones bancarias','RESULTADO','Resultado no operacional',1000,0,1000],
+    ['5-04-002','Impuestos y retenciones del periodo','RESULTADO','Resultado no operacional',0,0,0]]},
+  {nombre: 'Libro Diario', filas: [LD_CAB,
+    ld('00001','01-01-2026','APERTURA','Asiento de apertura del ejercicio','1-01-001','Banco Estado Cta. Cte. 12345678',1000000,0,'76900900-1','GAMMA AGRICOLA SPA'),
+    ld('00001','01-01-2026','APERTURA','Asiento de apertura del ejercicio','1-01-002','Banco Itau Cta. Cte. 0-222-333-4',500000,0,'76900900-1','GAMMA AGRICOLA SPA'),
+    ld('00001','01-01-2026','APERTURA','Asiento de apertura del ejercicio','3-01-001','Capital pagado',0,1500000,'76900900-1','GAMMA AGRICOLA SPA'),
+    ld('00002','05-01-2026','VENTAS','Venta a Cliente Uno','1-02-001','Deudores comerciales nacionales',119000,0,'76111111-1','CLIENTE UNO SPA'),
+    ld('00002','05-01-2026','VENTAS','Venta a Cliente Uno','4-01-001','Ventas del giro',0,100000,'76111111-1','CLIENTE UNO SPA'),
+    ld('00002','05-01-2026','VENTAS','Venta a Cliente Uno','2-02-001','IVA Debito Fiscal',0,19000,'76111111-1','CLIENTE UNO SPA'),
+    ld('00003','06-01-2026','VENTAS','Venta de exportacion','1-02-001','Deudores comerciales nacionales',200000,0,'55555555-5','FOREIGN BUYER LTD'),
+    ld('00003','06-01-2026','VENTAS','Venta de exportacion','4-01-001','Ventas del giro',0,200000,'55555555-5','FOREIGN BUYER LTD'),
+    ld('00004','07-01-2026','VENTAS','Venta a Cliente Dos','1-02-001','Deudores comerciales nacionales',238000,0,'76222222-2','CLIENTE DOS LTDA'),
+    ld('00004','07-01-2026','VENTAS','Venta a Cliente Dos','4-01-001','Ventas del giro',0,200000,'76222222-2','CLIENTE DOS LTDA'),
+    ld('00004','07-01-2026','VENTAS','Venta a Cliente Dos','2-02-001','IVA Debito Fiscal',0,38000,'76222222-2','CLIENTE DOS LTDA'),
+    ld('00005','10-01-2026','COMPRAS','Compra de insumos','5-01-001','Compras del giro',50000,0,'77333333-3','PROVEEDOR TRES SPA'),
+    ld('00005','10-01-2026','COMPRAS','Compra de insumos','1-03-001','IVA Credito Fiscal',9500,0,'77333333-3','PROVEEDOR TRES SPA'),
+    ld('00005','10-01-2026','COMPRAS','Compra de insumos','2-01-001','Proveedores nacionales',0,59500,'77333333-3','PROVEEDOR TRES SPA'),
+    ld('00006','15-01-2026','TESORERIA','Cobro Cliente Uno','1-01-001','Banco Estado Cta. Cte. 12345678',119000,0,'76111111-1','CLIENTE UNO SPA'),
+    ld('00006','15-01-2026','TESORERIA','Cobro Cliente Uno','1-02-001','Deudores comerciales nacionales',0,119000,'76111111-1','CLIENTE UNO SPA'),
+    ld('00007','16-01-2026','TESORERIA','Deposito sin identificar','1-01-002','Banco Itau Cta. Cte. 0-222-333-4',50000,0),
+    ld('00007','16-01-2026','TESORERIA','Deposito sin identificar','1-02-001','Deudores comerciales nacionales',0,50000),
+    ld('00008','20-01-2026','TESORERIA','Pago Proveedor Tres','2-01-001','Proveedores nacionales',59500,0,'77333333-3','PROVEEDOR TRES SPA'),
+    ld('00008','20-01-2026','TESORERIA','Pago Proveedor Tres','1-01-001','Banco Estado Cta. Cte. 12345678',0,59500,'77333333-3','PROVEEDOR TRES SPA'),
+    ld('00009','25-01-2026','TESORERIA','Comision bancaria','5-04-001','Gastos financieros y comisiones bancarias',1000,0),
+    ld('00009','25-01-2026','TESORERIA','Comision bancaria','1-01-002','Banco Itau Cta. Cte. 0-222-333-4',0,1000),
+    ld('00010','26-01-2026','TESORERIA','Traspaso entre cuentas','1-01-002','Banco Itau Cta. Cte. 0-222-333-4',100000,0),
+    ld('00010','26-01-2026','TESORERIA','Traspaso entre cuentas','1-01-001','Banco Estado Cta. Cte. 12345678',0,100000)]},
+  {nombre: 'Libro Mayor', filas: [['Cuenta','Nombre de la cuenta','Fecha','N. Asiento','Glosa','Documento','Debe','Haber','Saldo acumulado'],
+    ['1-01-001','Banco Estado Cta. Cte. 12345678','01-01-2026','00001','Apertura','x',1000000,'',1000000],
+    ['1-01-001','Banco Estado Cta. Cte. 12345678','15-01-2026','00006','Cobro','x',119000,'',1119000],
+    ['3-01-001','Capital pagado','01-01-2026','00001','Apertura','x','',1500000,-1500000]]},
+  {nombre: 'Balance Comprobacion', filas: [['BALANCE DE COMPROBACION AL 31 DE ENERO DE 2026'],
+    ['Codigo','Nombre de la cuenta','Debitos','Creditos','Saldo deudor','Saldo acreedor'],
+    ['1-01-001','Banco Estado Cta. Cte. 12345678',1119000,159500,959500,''],
+    ['3-01-001','Capital pagado',0,1500000,'',1500000]]},
+  {nombre: 'Observaciones', filas: [['N.','Materia','Monto','Detalle'], ['1','Cobro sin RUT','50000','Pedir respaldo']]}
+]);
+// Dos cartolas, una por cuenta, con el número en el encabezado. La primera trae el saldo solo arriba.
+const CARTOLA_ESTADO = 'Cartola histórica;;;\nCuenta Corriente N°: 12345678;;;\nSALDO INICIAL;DEPÓSITOS;OTROS CARGOS;SALDO FINAL\n1000000;119000;-259500;859500\n' +
+  'MONTO;DESCRIPCIÓN MOVIMIENTO;FECHA;CARGO/ABONO\n119000;Transferencia Cliente Uno;15/01/2026;A\n-59500;Pago Proveedor Tres;20/01/2026;C\n-100000;Traspaso a Itau;26/01/2026;C';
+const CARTOLA_ITAU = 'Nombre Empresa;GAMMA AGRICOLA SPA\nNumero Cuenta;0-222-333-4\nSaldo Anterior;500000\nSaldo Actual;649000\n' +
+  'Fecha;Descripción;Cargo;Abono;Saldo Diario\n16-01-2026;Deposito;;50000;550000\n25-01-2026;Comision;-1000;;549000\n26-01-2026;Traspaso desde Estado;;100000;649000';
+
+async function gamma(extra){
+  return procesarEmpresa(api, empresa({nombre: 'Gamma Agricola SpA', rut: '76.900.900-1', mes: 0},
+    Object.assign({'GAMMA_Libro_Diario_2026.xlsx': LIBRO_PROPIO, 'cartola-estado.csv': CARTOLA_ESTADO, 'cartola-itau.csv': CARTOLA_ITAU}, extra || {})));
+}
+
+caso('Libro de un contador: plan con clase y rubro, sin duplicar mayor ni balance', async ()=>{
+  const r = await gamma();
+  igual(r.errores, [], 'errores');
+  igual(r.S.asientos.length, 10, 'los 10 asientos del diario, ni uno más');
+  cierto(hay(r.avisos, /\[Libro Mayor\]: es el libro mayor/), 'el mayor no se carga dos veces');
+  cierto(hay(r.avisos, /\[Balance Comprobacion\]: es un balance armado desde el diario/), 'el balance no es una apertura');
+  cierto(!hay(r.avisos, /otra empresa|172 empresas/), 'la razón social de cada línea no se confunde con varias empresas');
+  const CTA = api.ev('CTA');
+  igual([CTA['106001'].clase, CTA['201002'].tipo, CTA['504002'].sub], ['nc', 'pasivo', 'otrosgastos'], 'la clase y el rubro del plan mandan');
+  igual(r.S.asientos.find(a => /apertura/i.test(a.glosa)).origen, 'apertura', 'el asiento de apertura se reconoce');
+  igual(Math.round(api.eri(api.asientosDelEjercicio()).neto), 449000, 'resultado: 500.000 − 50.000 − 1.000');
+});
+
+caso('Funciones de cuenta con el plan del cliente', async ()=>{
+  await gamma();
+  const rol = c => api.ev('rolCuenta')(c);
+  igual(['101001','101002','102001','103001','201001','202001'].map(rol), ['efectivo','efectivo','clientes','ivaCred','proveedores','ivaDeb'], 'roles');
+  const F = api.flujoCaja(api.corte());
+  igual(F.inicial, 1500000, 'saldo inicial = apertura de los dos bancos');
+  igual([F.total.op, F.total.inv, F.total.fin], [119000 + 50000 - 59500 - 1000, 0, 0], 'el traspaso entre bancos no es flujo');
+  igual(F.dif, 0, 'el flujo calza con el mayor');
+  const Q = api.cuadratura();
+  cierto(Q.chk.find(x => /Partida doble/.test(x.n)).ok, 'partida doble');
+});
+
+caso('Dos cuentas corrientes: cada cartola a su cuenta y conciliación exacta', async ()=>{
+  const r = await gamma();
+  igual(r.S.banco.cuentas.map(b => b.cuenta).sort(), ['101001', '101002'], 'cada cartola se reconoce por el número de cuenta');
+  for(const [cta, saldo] of [['101001', 959500], ['101002', 649000]]){
+    r.S.banco.cuenta = cta;
+    const I = api.informeConciliacion('2026-01-31');
+    igual([I.saldoCartola, I.saldoLibro, I.E.soloBanco.length, I.E.soloLibro.length, I.dif], [saldo, saldo, 0, 0, 0], 'cuenta ' + cta);
+  }
+});
+
+caso('Auxiliar desde el libro: por RUT, extranjeros por nombre y cobros sin RUT aparte', async ()=>{
+  await gamma();
+  const X = api.auxiliar('cli', '2026-01-31');
+  igual(X.modo, 'libro', 'se arma desde el libro');
+  igual(X.filas.map(g => [g.nombre, g.total]), [['CLIENTE DOS LTDA', 238000], ['FOREIGN BUYER LTD', 200000]], 'Cliente Uno quedó pagado');
+  igual(X.T.sinIdentificar, -50000, 'el depósito sin RUT no se aplica a ningún cliente');
+  igual([X.T.total, X.dif], [388000, 0], 'cuadra con la contabilidad');
+});
+
+// RCV del SII: NC de exportación, liquidación-factura recibida, combustible y documento de otro mes
+const RCV_V = 'Nro;Tipo Doc;Tipo Venta;Rut cliente;Razon Social;Folio;Fecha Docto;Monto Exento;Monto Neto;Monto IVA;Monto total\n' +
+  '1;33;Del Giro;76111111-1;CLIENTE UNO SPA;10;05/02/2026;0;100000;19000;119000\n' +
+  '2;110;Del Giro;55555555-5;FOREIGN BUYER LTD;11;06/02/2026;300000;0;0;300000\n' +
+  '3;112;Del Giro;55555555-5;FOREIGN BUYER LTD;12;07/02/2026;50000;0;0;50000\n' +
+  '4;43;Del Giro;76444444-4;FERIA REGIONAL SA;13;08/02/2026;0;200000;38000;238000\n';
+const RCV_C = 'Nro;Tipo Doc;Tipo Compra;RUT Proveedor;Razon Social;Folio;Fecha Docto;Monto Exento;Monto Neto;Monto IVA Recuperable;Monto Iva No Recuperable;Monto Total;Codigo Otro Impuesto;Valor Otro Impuesto\n' +
+  '1;33;Del Giro;77333333-3;PROVEEDOR TRES SPA;50;03/02/2026;0;100000;19000;;119000;;\n' +
+  '2;33;Del Giro;76555555-5;ESTACION DE SERVICIO;51;10/02/2026;0;40000;7600;;67600;35;20000\n' +
+  '3;43;Del Giro;76444444-4;FERIA REGIONAL SA;52;12/02/2026;0;150000;28500;;178500;;\n' +
+  '4;33;Del Giro;77333333-3;PROVEEDOR TRES SPA;53;28/01/2026;0;10000;1900;;11900;;\n' +
+  '5;34;Del Giro;97036000-K;BANCO;54;15/02/2026;0;0;0;;0;;\n';
+
+caso('RCV: NC de exportación, liquidación-factura, combustible y período del registro', async ()=>{
+  const S = api.estadoInicial(); S.emp.ejercicio = 2026; S.ui.ano = 2026; S.ui.mes = 1; api.fijarS(S); api.reconstruirPlan();
+  const filasV = api.parseCSV(RCV_V, ';'); filasV.periodo = '2026-02';
+  const filasC = api.parseCSV(RCV_C, ';'); filasC.periodo = '2026-02';
+  const v = api.analizarImport('', 'venta', 2026, filasV), c = api.analizarImport('', 'compra', 2026, filasC);
+  igual(c.docs.length, 4, 'el documento en $0 se omite');
+  cierto(v.docs.find(d => d.dte === '112').nc, 'la 112 es nota de crédito');
+  const liq = c.docs.find(d => d.dte === '43');
+  igual([liq.clase, liq.liqFactura], ['venta', true], 'la liquidación-factura recibida es una venta del mandante');
+  igual(c.docs.find(d => d.folio === '51').impEsp, 20000, 'el impuesto específico a la gasolina va al costo');
+  api.confirmarImport(v, '4101', true); api.confirmarImport(c, '1105', true);
+  const f = api.f29Ano()[1];
+  igual(f.debito, 19000 + 38000 + 28500, 'débito: factura + liquidación emitida + liquidación recibida');
+  igual(f.cred, 19000 + 7600 + 1900, 'crédito: sin el IVA de la liquidación y con la factura de enero registrada en febrero');
+  igual(f.netoExento, 300000 - 50000, 'exportaciones netas de la NC');
+  igual(f.ilaC, 0, 'el combustible no es crédito de impuesto adicional');
+  igual(api.f29Ano()[0].docs, 0, 'la factura del 28-01 va al período del registro (febrero)');
+  cierto(api.cuadraDiario().dif === 0, 'los asientos de los documentos cuadran con IVA no recuperable e impuesto específico');
+});
+
+caso('F29: remanente reajustado por la UTM', ()=>{
+  const S = api.estadoInicial(); S.emp.ejercicio = 2026; api.fijarS(S); api.reconstruirPlan();
+  S.par.remanenteInicial = 28967997;
+  S.par.utmMes = {'2026-01': 69751, '2026-02': 69611, '2026-03': 69889};
+  const A = api.f29Ano();
+  igual(A[0].remReaj, Math.round(28967997 * 0.998), 'enero: UTM de febrero sobre la de enero, −0,2 %');
+  igual(A[1].factorRem, 1.004, 'febrero: +0,4 %');
+  igual(A[2].sinUTM, true, 'sin la UTM de abril no se reajusta, y se avisa');
+});
+
+caso('Libro y RCV juntos: los documentos van solo al F29', async ()=>{
+  const r = await gamma({'RCV_VENTA_76900900-1_202601.csv': RCV_V.replace(/\/02\/2026/g, '/01/2026')});
+  igual(r.S.asientos.length, 10, 'los documentos no agregan asientos');
+  cierto(r.S.docs.length === 4 && r.S.docs.every(d => d.sinAsiento), 'quedan como documentos solo tributarios');
+  cierto(api.f29Ano()[0].debito > 0, 'y sí cuentan para el F29');
+});
+
+caso('F29 declarado: se lee la planilla con los códigos del formulario', ()=>{
+  const filas = [['Detalle F29'], ['Período','IVA débito (cód. 538)','IVA crédito del mes','Remanente CF (cód. 77)','PPM (cód. 62)','Total a pagar (cód. 547)'],
+                 ['01-2026','5053971','2092502','25948675','482745','567512'], ['02-2026','3342379','1691158','24401302','301191','442311']];
+  const d = api.analizarF29Declarado(filas);
+  igual(d.meses['2026-01'], {'538': 5053971, '520': 2092502, '077': 25948675, '062': 482745, '547': 567512}, 'enero');
+  igual(Object.keys(d.meses), ['2026-01', '2026-02'], 'meses');
+});
+
 /* ---------- a correr ---------- */
 
 console.log('Pruebas del robot de Cuadratura\n');
